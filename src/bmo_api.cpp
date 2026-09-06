@@ -466,10 +466,13 @@ int bmo_forward_temporal2(
     std::lock_guard<std::mutex> lk(h->mu);
     try {
 #ifdef BMO_ENABLE_CUDA
+        if (h->pos_host) {
+            *h->pos_host = pos;
+        }
+
         // Accelerated path: CUDA Graph execution
         if (h->temporal_captured && n_capture_layers == 0) {
             bmo_embed_input_tokens_into(h->ctx, h->model, input_tokens, num_codebooks, h->temporal_in_host);
-            *h->pos_host = pos;
 
             cudaGraphLaunch(h->temporal_graph_exec, h->stream);
             cudaStreamSynchronize(h->stream);
