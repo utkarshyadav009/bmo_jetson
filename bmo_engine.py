@@ -96,6 +96,17 @@ _lib.bmo_forward_depth.argtypes = [
 ]
 _lib.bmo_forward_depth.restype = ctypes.c_int
 
+if hasattr(_lib, "bmo_forward_depth_cascade"):
+    _lib.bmo_forward_depth_cascade.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_float,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int32),
+    ]
+    _lib.bmo_forward_depth_cascade.restype = ctypes.c_int
+
 _lib.bmo_last_error.argtypes = [ctypes.c_void_p]
 _lib.bmo_last_error.restype  = ctypes.c_char_p
 
@@ -118,6 +129,7 @@ class BMOEngine:
         self._buf_z       = np.empty(self.n_embd,      dtype=np.float32)
         self._buf_text    = np.empty(self.text_vocab,  dtype=np.float32)
         self._buf_audio   = np.empty(self.audio_vocab, dtype=np.float32)
+        self._buf_depth_audio = np.empty(8, dtype=np.int32)
 
     def reset(self) -> None:
         _lib.bmo_reset(self._h)
@@ -218,6 +230,30 @@ class BMOEngine:
         if copy:
             return self._buf_audio.copy()
         return self._buf_audio
+
+    def forward_depth_cascade(
+        self,
+        text_token: int,
+        transformer_out: np.ndarray,
+        temp: float = 0.8,
+        top_k: int = 250,
+    ) -> np.ndarray:
+        if not hasattr(_lib, "bmo_forward_depth_cascade"):
+            raise RuntimeError("libbmo.so was built without bmo_forward_depth_cascade")
+        if not transformer_out.flags['C_CONTIGUOUS']:
+            transformer_out = np.ascontiguousarray(transformer_out)
+        rc = _lib.bmo_forward_depth_cascade(
+            self._h,
+            int(text_token),
+            transformer_out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            float(temp),
+            int(top_k),
+            self._buf_depth_audio.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+        )
+        if rc != 0:
+            err = _lib.bmo_last_error(self._h)
+            raise RuntimeError(f"forward_depth_cascade rc={rc}: {err.decode() if err else 'unknown'}")
+        return self._buf_depth_audio.copy()
 
     def get_k_cache_f32(self, layer: int, t_start: int, n_positions: int) -> np.ndarray:
         """Temporal K-cache slice as float32, layout (n_positions, n_heads, head_dim)."""

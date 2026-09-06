@@ -228,9 +228,7 @@ def main():
             inp_toks[10:] = 2048
             z, t_logits = engine.forward_temporal(inp_toks)
             prev_t = int(np.argmax(t_logits))
-            for d in range(8):
-                d_logits = engine.forward_depth(d, prev_t, z)
-                prev_t = int(np.argmax(d_logits))
+            _ = engine.forward_depth_cascade(prev_t, z, temp=0.0, top_k=0)
             dec_in = torch.zeros((1, 8, 1), device="cuda", dtype=torch.long)
             _ = mimi.decode(dec_in)
 
@@ -248,63 +246,54 @@ def main():
     callback_calls = 0
     stop_event = threading.Event()
 
+    def output_callback(outdata, frames, time_info, status):
+        nonlocal underflow_count, callback_calls
+        callback_calls += 1
+        if status.output_underflow:
+            underflow_count += 1
+
+        try:
+            pcm_out = output_queue.get_nowait()
+            outdata[:, 0] = pcm_out
+        except queue.Empty:
+            outdata.fill(0)
+            underflow_count += 1
+
+    in_stream = None
     if args.use_mic:
-        def audio_callback(indata, outdata, frames, time_info, status):
-            nonlocal underflow_count, overflow_count, callback_calls
-            callback_calls += 1
+        def input_callback(indata, frames, time_info, status):
+            nonlocal overflow_count
             if status.input_overflow:
                 overflow_count += 1
-            if status.output_underflow:
-                underflow_count += 1
-
             chunk = indata[:, 0].copy()
             try:
                 input_queue.put_nowait(chunk)
             except queue.Full:
                 overflow_count += 1
 
-            try:
-                pcm_out = output_queue.get_nowait()
-                outdata[:, 0] = pcm_out
-            except queue.Empty:
-                outdata.fill(0)
-                underflow_count += 1
-
-        print("\n[+] Starting Full-Duplex Stream (Microphone Input + Speaker Output)...")
-        stream = sd.Stream(
+        print("\n[+] Starting Decoupled Audio Input Stream (Microphone Capture)...")
+        in_stream = sd.InputStream(
             samplerate=24000,
             blocksize=1920,
             device=audio_device,
             channels=1,
             dtype='float32',
-            callback=audio_callback,
+            callback=input_callback,
         )
-    else:
-        def playback_callback(outdata, frames, time_info, status):
-            nonlocal underflow_count, overflow_count, callback_calls
-            callback_calls += 1
-            if status.output_underflow:
-                underflow_count += 1
 
-            try:
-                pcm_out = output_queue.get_nowait()
-                outdata[:, 0] = pcm_out
-            except queue.Empty:
-                outdata.fill(0)
-                underflow_count += 1
-
-        print("\n[+] Starting Real-Time Playback Stream (Feeder Thread Input + Speaker Output)...")
-        stream = sd.OutputStream(
-            samplerate=24000,
-            blocksize=1920,
-            device=audio_device,
-            channels=1,
-            dtype='float32',
-        )
+    print("\n[+] Starting Real-Time Audio Playback Stream (Speaker / Headphone Output)...")
+    out_stream = sd.OutputStream(
+        samplerate=24000,
+        blocksize=1920,
+        device=audio_device,
+        channels=1,
+        dtype='float32',
+        callback=output_callback,
+    )
 
     # Pre-roll 4 frames (320 ms) of comfort silence into output queue
     silence_frame = np.zeros(frame_size, dtype=np.float32)
-    for _ in range(6):
+    for _ in range(8):
         output_queue.put(silence_frame.copy())
 
     def feeder_thread():
@@ -348,9 +337,12 @@ def main():
     turn_agent_speaking = False
     turnaround_latencies = []
     user_speech_end_time = 0.0
+    session_pcm_records = []
 
     start_rss = get_vram_mb()
-    stream.start()
+    out_stream.start()
+    if in_stream is not None:
+        in_stream.start()
 
     print(f"[+] Audio stream active. Running {args.duration:.1f}s live voice test...\n")
     if args.use_mic:
@@ -421,15 +413,14 @@ def main():
                 if not is_pause:
                     recent_text_tokens.append(next_text_token)
 
-                # Step D: Depth Cascade (8 steps)
+                # Step D: Depth Cascade (8 steps, C++ fused)
                 t_depth_0 = time.perf_counter()
-                curr_agent_audio = np.zeros(8, dtype=np.int32)
-                depth_prev = next_text_token
-                for cb_idx in range(8):
-                    depth_logits = engine.forward_depth(cb_idx, depth_prev, z)
-                    depth_logits[2048:] = -1e9
-                    depth_prev = sample_token(depth_logits, temp=args.temp_audio, top_k=args.top_k_audio, use_sampling=args.sample)
-                    curr_agent_audio[cb_idx] = depth_prev
+                curr_agent_audio = engine.forward_depth_cascade(
+                    next_text_token,
+                    z,
+                    temp=args.temp_audio if args.sample else 0.0,
+                    top_k=args.top_k_audio if args.sample else 0,
+                )
                 t_depth = (time.perf_counter() - t_depth_0) * 1000.0
 
                 t_bmo = t_temporal + t_depth
@@ -455,6 +446,7 @@ def main():
                     output_queue.put_nowait(pcm_out)
                 except queue.Full:
                     pass
+                session_pcm_records.append(pcm_out.copy())
 
                 # Check agent speaking activity
                 agent_rms = float(np.sqrt(np.mean(pcm_out ** 2)))
@@ -503,8 +495,11 @@ def main():
 
     finally:
         stop_event.set()
-        stream.stop()
-        stream.close()
+        if in_stream is not None:
+            in_stream.stop()
+            in_stream.close()
+        out_stream.stop()
+        out_stream.close()
 
     total_wallclock = time.perf_counter() - t_start
     final_rss = get_vram_mb()
@@ -560,6 +555,12 @@ def main():
         print(f"  [PASS] Memory Stable over stream (Drift: +{final_rss - start_rss:.2f} MB)")
     else:
         print(f"  [WARN] Memory Drift (+{final_rss - start_rss:.2f} MB)")
+
+    if session_pcm_records:
+        import scipy.io.wavfile as wav
+        all_rec = np.concatenate(session_pcm_records)
+        wav.write("output_realtime_session.wav", 24000, (np.clip(all_rec, -1.0, 1.0) * 32767).astype(np.int16))
+        print(f"  [+] Saved session audio to output_realtime_session.wav ({len(all_rec)/24000:.2f}s, RMS: {np.sqrt(np.mean(all_rec**2)):.4f})")
 
     print("\nLive Voice Streaming benchmark completed successfully!")
 

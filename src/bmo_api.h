@@ -129,6 +129,16 @@ BMO_API int bmo_forward_depth(
     const float * transformer_out,
     float * out_audio_logits);
 
+// Runs the full 8-step depth cascade in C++ with integrated top-k sampling.
+// Eliminates cross-language ctypes marshalling for the inner depth loop.
+BMO_API int bmo_forward_depth_cascade(
+    bmo_handle_t * h,
+    int32_t text_token,
+    const float * transformer_out,
+    float temp_audio,
+    int top_k_audio,
+    int32_t * out_audio_tokens);
+
 // Returns a NUL-terminated string describing the most recent error on this
 // handle, or NULL if there is no pending error. The pointer is owned by the
 // handle and is valid until the next API call on the same handle.

@@ -10,6 +10,7 @@ lib/
 *.a
 *.so
 *.dylib
+bmo_daemon
 
 # Local symlinks & dependencies
 llama.cpp
