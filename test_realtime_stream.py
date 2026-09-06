@@ -390,10 +390,20 @@ def main():
                 user_tokens = user_codes[0, :, 0].detach().cpu().numpy().astype(np.int32)
 
                 # Step B: 17-Token Interleave with Moshi delay invariant
-                tokens_17[0] = prev_agent_text
-                tokens_17[1:9] = prev_agent_audio
-                tokens_17[9] = user_tokens[0]
-                tokens_17[10:17] = prev_user_audio[1:8]
+                if frame_count == 0:
+                    tokens_17[0] = 32000
+                    tokens_17[1:] = 2048
+                elif frame_count == 1:
+                    tokens_17[0] = prev_agent_text
+                    tokens_17[1] = prev_agent_audio[0]
+                    tokens_17[2:9] = 2048
+                    tokens_17[9] = user_tokens[0]
+                    tokens_17[10:17] = 2048
+                else:
+                    tokens_17[0] = prev_agent_text
+                    tokens_17[1:9] = prev_agent_audio
+                    tokens_17[9] = user_tokens[0]
+                    tokens_17[10:17] = prev_user_audio[1:8]
 
                 # Step C: Temporal Forward
                 t_temp_0 = time.perf_counter()
@@ -401,8 +411,15 @@ def main():
                 t_temporal = (time.perf_counter() - t_temp_0) * 1000.0
 
                 text_logits[32000:] = -1e9
-                next_text_token = sample_token(text_logits, temp=args.temp_text, top_k=args.top_k_text, use_sampling=args.sample)
-                recent_text_tokens.append(next_text_token)
+                top_1_text = int(np.argmax(text_logits[:32000]))
+                is_pause = top_1_text in (0, 3, 555, 263, 1095, 1101)
+                if not is_pause and args.sample:
+                    next_text_token = sample_token(text_logits, temp=args.temp_text, top_k=args.top_k_text, use_sampling=True)
+                else:
+                    next_text_token = top_1_text
+
+                if not is_pause:
+                    recent_text_tokens.append(next_text_token)
 
                 # Step D: Depth Cascade (8 steps)
                 t_depth_0 = time.perf_counter()
@@ -418,19 +435,22 @@ def main():
                 t_bmo = t_temporal + t_depth
 
                 # Step E: Un-delayed Agent Decode
-                decode_audio = curr_agent_audio.copy()
-                decode_audio[0] = prev_agent_cb0
+                t_dec = 0.0
+                pcm_out = np.zeros(frame_size, dtype=np.float32)
+                if frame_count > 0:
+                    decode_audio = curr_agent_audio.copy()
+                    decode_audio[0] = prev_agent_cb0
 
-                agent_tensor_gpu.copy_(torch.from_numpy(decode_audio).view(1, 8, 1))
-                t_dec_0 = time.perf_counter()
-                decoded_frame = mimi.decode(agent_tensor_gpu)
-                torch.cuda.synchronize()
-                t_dec = (time.perf_counter() - t_dec_0) * 1000.0
+                    agent_tensor_gpu.copy_(torch.from_numpy(decode_audio).view(1, 8, 1))
+                    t_dec_0 = time.perf_counter()
+                    decoded_frame = mimi.decode(agent_tensor_gpu)
+                    torch.cuda.synchronize()
+                    t_dec = (time.perf_counter() - t_dec_0) * 1000.0
+                    pcm_out = decoded_frame[0, 0].detach().cpu().numpy()
 
                 t_frame_total = (time.perf_counter() - t_frame_start) * 1000.0
 
                 # Queue output for playback
-                pcm_out = decoded_frame[0, 0].detach().cpu().numpy()
                 try:
                     output_queue.put_nowait(pcm_out)
                 except queue.Full:

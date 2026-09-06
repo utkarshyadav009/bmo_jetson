@@ -189,7 +189,8 @@ static std::vector<std::string> load_vocab(const std::string & path) {
 }
 
 static void print_token(const std::string & token) {
-    if (token.empty() || token == "<unk>" || token == "<pad>" || token == "<s>" || token == "</s>") {
+    if (token.empty() || token == "<unk>" || token == "<pad>" || token == "<s>" || token == "</s>"
+        || token == "..." || token == "…" || token == "." || token == " ...") {
         return;
     }
     std::string piece = token;
@@ -477,6 +478,8 @@ int main(int argc, char ** argv) {
     std::string vocab_path      = "bmo_vocab.txt";
     std::string input_wav_path  = "/home/bmo/bmo_ref_clip.wav";
     std::string alsa_device     = "pulse";
+    std::string audio_mode      = "auto";
+    int force_hp                = -1; // -1 = auto, 1 = headphone, 0 = speaker
     float duration_sec          = 0.0f; // 0 = run until Ctrl+C
     bool use_mic                = true; // default to live mic
     bool use_sampling           = true;
@@ -495,6 +498,9 @@ int main(int argc, char ** argv) {
         else if (arg == "--wav" && i + 1 < argc) { input_wav_path = argv[++i]; use_mic = false; }
         else if (arg == "--duration" && i + 1 < argc) duration_sec = std::stof(argv[++i]);
         else if (arg == "--device" && i + 1 < argc) alsa_device = argv[++i];
+        else if (arg == "--audio" && i + 1 < argc) audio_mode = argv[++i];
+        else if (arg == "--headphone") force_hp = 1;
+        else if (arg == "--speaker") force_hp = 0;
         else if (arg == "--mic" || arg == "--live") use_mic = true;
         else if (arg == "--greedy") use_sampling = false;
         else if (arg == "--temp-text" && i + 1 < argc) temp_text = std::stof(argv[++i]);
@@ -504,8 +510,11 @@ int main(int argc, char ** argv) {
     }
 
     // Auto-configure audio routing to ensure Bluetooth headset or USB speaker/mic is active
-    std::cout << "[*] Synchronizing PulseAudio endpoints via bmo_audio_routing..." << std::endl;
-    int ret_route = std::system("python3 /home/bmo/bmo_audio_routing.py");
+    std::cout << "[*] Synchronizing PulseAudio endpoints via bmo_audio_routing (mode=" << audio_mode << ")..." << std::endl;
+    std::string route_cmd = "python3 /home/bmo/bmo_audio_routing.py --mode " + audio_mode;
+    if (force_hp == 1) route_cmd += " --headphone";
+    else if (force_hp == 0) route_cmd += " --speaker";
+    int ret_route = std::system(route_cmd.c_str());
     (void)ret_route;
 
     std::cout << "======================================================================\n";
@@ -608,8 +617,8 @@ int main(int argc, char ** argv) {
     float *h_text_logits = nullptr;
     float *h_audio_logits = nullptr;
     cudaMallocHost(&h_z, 4096 * sizeof(float));
-    cudaMallocHost(&h_text_logits, 32000 * sizeof(float));
-    cudaMallocHost(&h_audio_logits, 2048 * sizeof(float));
+    cudaMallocHost(&h_text_logits, 32001 * sizeof(float));
+    cudaMallocHost(&h_audio_logits, 2049 * sizeof(float));
 
     // 4. Initialize ALSA Audio Subsystem
     std::cout << "[4/4] Starting ALSA Audio Duplex Engine (" << alsa_device << ")..." << std::endl;
@@ -701,10 +710,21 @@ int main(int argc, char ** argv) {
         cudaMemcpy(user_tokens, d_rvq_codes, 8 * sizeof(int32_t), cudaMemcpyDeviceToHost);
 
         // Step C: Interleave 17 Codebook Channels (Kyutai Moshi invariant)
-        tokens_17[0] = prev_agent_text;
-        for (int i = 0; i < 8; ++i) tokens_17[1 + i] = prev_agent_audio[i];
-        tokens_17[9] = user_tokens[0];
-        for (int i = 1; i < 8; ++i) tokens_17[9 + i] = prev_user_audio[i];
+        if (frame_count == 0) {
+            tokens_17[0] = 32000;
+            for (int i = 1; i < 17; ++i) tokens_17[i] = 2048;
+        } else if (frame_count == 1) {
+            tokens_17[0] = prev_agent_text;
+            tokens_17[1] = prev_agent_audio[0];
+            for (int i = 2; i <= 8; ++i) tokens_17[i] = 2048;
+            tokens_17[9] = user_tokens[0];
+            for (int i = 10; i < 17; ++i) tokens_17[i] = 2048;
+        } else {
+            tokens_17[0] = prev_agent_text;
+            for (int i = 0; i < 8; ++i) tokens_17[1 + i] = prev_agent_audio[i];
+            tokens_17[9] = user_tokens[0];
+            for (int i = 1; i < 8; ++i) tokens_17[9 + i] = prev_user_audio[i];
+        }
 
         // Step D: libbmo Temporal Forward (CUDA Graph)
         auto t_temp0 = std::chrono::high_resolution_clock::now();
@@ -714,10 +734,16 @@ int main(int argc, char ** argv) {
 
         // Sample next text token
         h_text_logits[32000] = -1e9f;
-        int next_text_token = sample_token_cpp(h_text_logits, 32000, temp_text, top_k_text, scratch_text, rng);
+        int top_1_text = (int)(std::max_element(h_text_logits, h_text_logits + 32000) - h_text_logits);
+        int next_text_token = top_1_text;
+        bool is_pause = (top_1_text == 3 || top_1_text == 0 || top_1_text == 555 ||
+                         top_1_text == 263 || top_1_text == 1095 || top_1_text == 1101);
+        if (!is_pause && use_sampling) {
+            next_text_token = sample_token_cpp(h_text_logits, 32000, temp_text, top_k_text, scratch_text, rng);
+        }
 
-        // Print streamed text
-        if (next_text_token >= 0 && next_text_token < (int)vocab.size()) {
+        // Print streamed text if not a pause/pad token
+        if (!is_pause && next_text_token >= 0 && next_text_token < (int)vocab.size()) {
             print_token(vocab[next_text_token]);
         }
 
@@ -728,7 +754,11 @@ int main(int argc, char ** argv) {
         for (int cb = 0; cb < 8; ++cb) {
             bmo_forward_depth(engine, cb, depth_prev, h_z, h_audio_logits);
             h_audio_logits[2048] = -1e9f;
-            depth_prev = sample_token_cpp(h_audio_logits, 2048, temp_audio, top_k_audio, scratch_audio, rng);
+            if (use_sampling) {
+                depth_prev = sample_token_cpp(h_audio_logits, 2048, temp_audio, top_k_audio, scratch_audio, rng);
+            } else {
+                depth_prev = (int)(std::max_element(h_audio_logits, h_audio_logits + 2048) - h_audio_logits);
+            }
             curr_agent_audio[cb] = depth_prev;
         }
         auto t_dep1 = std::chrono::high_resolution_clock::now();
@@ -736,20 +766,24 @@ int main(int argc, char ** argv) {
 
         // Step F: Mimi Decode (Fused RVQ + TensorRT FP16 SEANet)
         auto t_dec0 = std::chrono::high_resolution_clock::now();
-        int32_t decode_tokens[8];
-        for (int i = 0; i < 8; ++i) decode_tokens[i] = curr_agent_audio[i];
-        decode_tokens[0] = prev_agent_cb0; // Un-delayed cb 0
+        std::vector<float> pcm_out_h(1920, 0.0f);
+        double ms_dec = 0.0;
 
-        cudaMemcpyAsync(d_dec_codes, decode_tokens, 8 * sizeof(int32_t), cudaMemcpyHostToDevice, stream);
-        bmo_rvq_decode(d_dec_codes, d_proj_tables, d_dec_latent, stream);
-        trt_dec.execute(d_dec_latent, d_pcm_out, stream);
-        cudaStreamSynchronize(stream);
+        if (frame_count > 0) {
+            int32_t decode_tokens[8];
+            decode_tokens[0] = prev_agent_cb0; // cb 0 from frame t-1
+            for (int i = 1; i < 8; ++i) decode_tokens[i] = curr_agent_audio[i]; // cb 1..7 from frame t
+
+            cudaMemcpyAsync(d_dec_codes, decode_tokens, 8 * sizeof(int32_t), cudaMemcpyHostToDevice, stream);
+            bmo_rvq_decode(d_dec_codes, d_proj_tables, d_dec_latent, stream);
+            trt_dec.execute(d_dec_latent, d_pcm_out, stream);
+            cudaStreamSynchronize(stream);
+            cudaMemcpy(pcm_out_h.data(), d_pcm_out, 1920 * sizeof(float), cudaMemcpyDeviceToHost);
+        }
         auto t_dec1 = std::chrono::high_resolution_clock::now();
-        double ms_dec = std::chrono::duration<double, std::milli>(t_dec1 - t_dec0).count();
+        ms_dec = std::chrono::duration<double, std::milli>(t_dec1 - t_dec0).count();
 
         // Step G: Playback Queue & State Update
-        std::vector<float> pcm_out_h(1920);
-        cudaMemcpy(pcm_out_h.data(), d_pcm_out, 1920 * sizeof(float), cudaMemcpyDeviceToHost);
         alsa.out_queue.push(pcm_out_h);
 
         if (out_recording.size() < 24000 * 300) { // Limit recording buffer to 5 mins
