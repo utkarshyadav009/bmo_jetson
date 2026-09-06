@@ -270,6 +270,10 @@ struct bmo_context {
     ggml_context * work_ctx = nullptr;
     std::vector<uint8_t> work_mem;
     std::vector<float> shared_scratch_w;
+    void * stream = nullptr;           // Active CUDA stream (cudaStream_t)
+    void * pos_dev = nullptr;          // Device-mapped int pointer for dynamic pos/past in CUDA graphs
+    void * depth_tok_emb_host = nullptr; // Dedicated static buffer for depth token embeddings
+    void * depth_tok_emb_dev = nullptr;  // Device alias for depth_tok_emb_host
     struct owned_tensor_upload {
         ggml_tensor * tensor = nullptr;
         std::vector<uint8_t> bytes;
@@ -331,6 +335,13 @@ struct ggml_tensor * bmo_embed_input_tokens(
     const int32_t * input_tokens,
     int num_codebooks);
 
+void bmo_embed_input_tokens_into(
+    const bmo_context & ctx,
+    const bmo_model & model,
+    const int32_t * input_tokens,
+    int num_codebooks,
+    float * acc);
+
 #ifdef BMO_ENABLE_CUDA
 void launch_fused_dequant_matvec(
     const void * pw,
@@ -377,7 +388,8 @@ void launch_rope_interleaved(
     int pos_base,
     float theta_base,
     float * y_dev,
-    void * stream = nullptr);
+    void * stream = nullptr,
+    const int * pos_dev = nullptr);
 
 void launch_swiglu_split(
     const float * h_dev,
@@ -407,5 +419,6 @@ void launch_decode_attention(
     int n_ctx,
     int n_past,
     int layer,
-    void * stream = nullptr);
+    void * stream = nullptr,
+    const int * pos_dev = nullptr);
 #endif

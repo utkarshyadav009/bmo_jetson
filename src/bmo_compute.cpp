@@ -366,13 +366,13 @@ static void launch_fused_dequant_matvec_jetson(
     }
 }
 
+static int g_staging_next_slot = 0;
 static staging_slot borrow_staging(gpu_staging_pool & p) {
-    static int next_slot = 0;
     for (int count = 0; count < gpu_staging_pool::N_SLOTS; ++count) {
-        int i = (next_slot + count) % gpu_staging_pool::N_SLOTS;
+        int i = (g_staging_next_slot + count) % gpu_staging_pool::N_SLOTS;
         if (!p.in_use[i] && p.host[i] && p.dev[i]) {
             p.in_use[i] = true;
-            next_slot = (i + 1) % gpu_staging_pool::N_SLOTS;
+            g_staging_next_slot = (i + 1) % gpu_staging_pool::N_SLOTS;
             return staging_slot { p.host[i], p.dev[i], i, &p };
         }
     }
@@ -383,6 +383,7 @@ static void release_all_staging(gpu_staging_pool & p) {
     for (int i = 0; i < gpu_staging_pool::N_SLOTS; ++i) {
         p.in_use[i] = false;
     }
+    g_staging_next_slot = 0;
 }
 
 // Eagerly executes a fused RMSNorm + element-wise weight multiply on the GPU
@@ -458,7 +459,7 @@ static ggml_tensor * apply_rmsnorm_gpu(
 
         (void) cudaGetLastError();
 
-        launch_rmsnorm(x_col_dev, w_dev, eps, n_embd, y_dev_slot, nullptr);
+        launch_rmsnorm(x_col_dev, w_dev, eps, n_embd, y_dev_slot, ctx.stream);
 
         cudaError_t rms_err = cudaGetLastError();
         if (rms_err != cudaSuccess) {
@@ -540,7 +541,7 @@ static ggml_tensor * apply_residual_gpu(
     }
 
     staging_slot out = borrow_staging(ctx.staging);
-    launch_residual_add(a_dev, b_dev, n, (float *) out.dev, nullptr);
+    launch_residual_add(a_dev, b_dev, n, (float *) out.dev, ctx.stream);
 
     // Deferred sync: see apply_rmsnorm_gpu for rationale.
     if (cudaGetLastError() != cudaSuccess) {
@@ -606,7 +607,7 @@ static ggml_tensor * apply_rope_gpu_interleaved(
     staging_slot out = borrow_staging(ctx.staging);
     launch_rope_interleaved(
         x_dev, n_heads, head_dim, n_token, pos_base, ctx.rope_theta,
-        (float *) out.dev, nullptr);
+        (float *) out.dev, ctx.stream, (const int *) ctx.pos_dev);
 
     // Deferred sync: see apply_rmsnorm_gpu for rationale.
     if (cudaGetLastError() != cudaSuccess) {
@@ -655,7 +656,7 @@ static ggml_tensor * apply_swiglu_gpu(
     }
 
     staging_slot out_slot = borrow_staging(ctx.staging);
-    launch_swiglu_split(h_dev, d_ff, (float *) out_slot.dev, nullptr);
+    launch_swiglu_split(h_dev, d_ff, (float *) out_slot.dev, ctx.stream);
 
     // Deferred sync: see apply_rmsnorm_gpu for rationale.
     if (cudaGetLastError() != cudaSuccess) {
@@ -738,7 +739,7 @@ static ggml_tensor * apply_dense_q4_0_linear_gpu(
         rows,
         cols,
         ctx.q8_scratch_dev,
-        nullptr);
+        ctx.stream);
 
     cudaError_t k_err = cudaGetLastError();
     if (k_err != cudaSuccess) {
@@ -1863,61 +1864,22 @@ void bmo_reset_work_ctx(bmo_context & ctx) {
     }
 }
 
-ggml_tensor * bmo_embed_input_tokens(
-    bmo_context & ctx,
-    bmo_model & model,
+void bmo_embed_input_tokens_into(
+    const bmo_context & ctx,
+    const bmo_model & model,
     const int32_t * input_tokens,
-    int num_codebooks) {
-    if (!ctx.work_ctx) {
-        throw std::runtime_error("bmo_embed_input_tokens: work_ctx not initialized");
-    }
-    if (!input_tokens || num_codebooks <= 0) {
-        throw std::runtime_error("bmo_embed_input_tokens: invalid input_tokens / num_codebooks");
-    }
-
-    // Resolve n_embd from whichever temporal table is available so we can
-    // size the output tensor before any other work.
-    int64_t n_embd = 0;
-    if (model.temporal_text_emb) {
-        n_embd = model.temporal_text_emb->ne[0];
-    } else {
-        for (auto * t : model.temporal_audio_embs) {
-            if (t) { n_embd = t->ne[0]; break; }
-        }
-    }
-    if (n_embd <= 0) {
-        throw std::runtime_error(
-            "bmo_embed_input_tokens: no temporal embedding tables loaded "
-            "(emb.{k}.weight / text_emb.weight). Re-export the GGUF.");
-    }
-
-    ggml_context * wctx = ctx.work_ctx;
-
-    // We must return a *leaf* tensor whose ->data is already populated, because
-    // the temporal graph immediately consumes it through eager-GPU ops
-    // (apply_rmsnorm_gpu, apply_linear_with_transient_unpack, ...) at build
-    // time. Building the embedding as ggml_get_rows + ggml_add nodes would
-    // leave ->data uninitialized until ggml_graph_compute_with_ctx runs, which
-    // happens *after* every eager kernel has already executed. So instead we
-    // synthesise the sum on the host and memcpy it in.
-    ggml_tensor * out = ggml_new_tensor_2d(wctx, GGML_TYPE_F32, n_embd, 1);
-    if (!out || !out->data) {
-        throw std::runtime_error("bmo_embed_input_tokens: failed to allocate output tensor");
-    }
-    float * acc = (float *) out->data;
+    int num_codebooks,
+    float * acc) {
+    const int64_t n_embd = ctx.n_embd;
     std::memset(acc, 0, (size_t) n_embd * sizeof(float));
+    std::vector<float> tmp_row(n_embd);
 
     auto add_row = [&](const ggml_tensor * t, int32_t tok, int channel_id) {
         if (!t || tok < 0) return;
         const int64_t d = t->ne[0];
         const int64_t vocab = t->ne[1];
-        if (d != n_embd) {
-            throw std::runtime_error(
-                "bmo_embed_input_tokens: embedding dim mismatch on channel "
-                + std::to_string(channel_id) + " (got " + std::to_string(d)
-                + ", expected " + std::to_string(n_embd) + ")");
-        }
-        if (vocab > 0 && tok >= vocab) return;            // out-of-vocab: skip
+        if (d != n_embd) return;
+        if (vocab > 0 && tok >= vocab) return;
         const uint8_t * row = (const uint8_t *) t->data + (size_t) tok * t->nb[1];
         switch (t->type) {
             case GGML_TYPE_F32: {
@@ -1930,21 +1892,56 @@ ggml_tensor * bmo_embed_input_tokens(
                 for (int64_t i = 0; i < n_embd; ++i) acc[i] += ggml_fp16_to_fp32(h[i]);
                 break;
             }
-            default:
-                throw std::runtime_error(
-                    "bmo_embed_input_tokens: unsupported dtype "
-                    + std::to_string((int) t->type) + " on channel "
-                    + std::to_string(channel_id));
+            default: {
+                const struct ggml_type_traits * traits = ggml_get_type_traits(t->type);
+                if (traits && traits->to_float) {
+                    traits->to_float(row, tmp_row.data(), n_embd);
+                    for (int64_t i = 0; i < n_embd; ++i) acc[i] += tmp_row[i];
+                }
+                break;
+            }
         }
     };
 
-    // Moshi token layout: tokens[0] = text, tokens[1..K-1] = audio codebooks.
     add_row(model.temporal_text_emb, input_tokens[0], /*channel_id=*/0);
     for (int k = 1; k < num_codebooks; ++k) {
         const int audio_idx = k - 1;
         if ((size_t) audio_idx >= model.temporal_audio_embs.size()) break;
         add_row(model.temporal_audio_embs[(size_t) audio_idx], input_tokens[k], k);
     }
+}
+
+ggml_tensor * bmo_embed_input_tokens(
+    bmo_context & ctx,
+    bmo_model & model,
+    const int32_t * input_tokens,
+    int num_codebooks) {
+    if (!input_tokens) {
+        throw std::runtime_error("bmo_embed_input_tokens: input_tokens is null");
+    }
+    int64_t n_embd = ctx.n_embd;
+    if (n_embd <= 0) {
+        if (model.temporal_text_emb) {
+            n_embd = model.temporal_text_emb->ne[0];
+        } else {
+            for (auto * t : model.temporal_audio_embs) {
+                if (t) { n_embd = t->ne[0]; break; }
+            }
+        }
+    }
+    if (n_embd <= 0) {
+        throw std::runtime_error(
+            "bmo_embed_input_tokens: no temporal embedding tables loaded "
+            "(emb.{k}.weight / text_emb.weight). Re-export the GGUF.");
+    }
+
+    ggml_context * wctx = ctx.work_ctx;
+    ggml_tensor * out = ggml_new_tensor_2d(wctx, GGML_TYPE_F32, n_embd, 1);
+    if (!out || !out->data) {
+        throw std::runtime_error("bmo_embed_input_tokens: failed to allocate output tensor");
+    }
+    float * acc = (float *) out->data;
+    bmo_embed_input_tokens_into(ctx, model, input_tokens, num_codebooks, acc);
 
     // Diagnostic: confirm the embedding sum is non-zero. With token text=PAD=3
     // plus audio=0 across all 16 codebooks, the sum should NOT be all zeros.
@@ -2080,7 +2077,11 @@ void bmo_execute_graph(bmo_context & ctx, ggml_cgraph * gf, const std::vector<te
 #ifdef BMO_JETSON
     (void) cudaGetLastError();
     if (sync_cuda) {
-        cudaStreamSynchronize(0);
+        if (ctx.stream) {
+            cudaStreamSynchronize((cudaStream_t) ctx.stream);
+        } else {
+            cudaStreamSynchronize(0);
+        }
     }
 #endif
 
@@ -2355,7 +2356,7 @@ ggml_cgraph * bmo_build_temporal_graph(
                         ctx.v_cache->extra,
                         (float *) attn_slot.dev,
                         ctx.head_dim, ctx.n_heads, n_kv_heads, ctx.n_ctx,
-                        n_past, layer, nullptr);
+                        n_past, layer, ctx.stream, (const int *) ctx.pos_dev);
                     attn_slot.pool = nullptr;
                     ggml_tensor * attn_3d = ggml_new_tensor_3d(wctx, GGML_TYPE_F32, ctx.head_dim, ctx.n_heads, 1);
                     attn_3d->data = attn_slot.host;
@@ -2810,20 +2811,48 @@ ggml_cgraph * bmo_build_depth_graph(
     ggml_tensor * x = nullptr;
 #ifdef BMO_JETSON
     if (n_token == 1) {
-        staging_slot last_tok_slot = borrow_staging(ctx.staging);
-        float * last_tok_host = (float *) last_tok_slot.host;
+        staging_slot last_tok_slot {};
+        float * last_tok_host = nullptr;
+        void * last_tok_dev = nullptr;
+        if (ctx.depth_tok_emb_host && ctx.depth_tok_emb_dev) {
+            last_tok_host = (float *) ctx.depth_tok_emb_host;
+            last_tok_dev = ctx.depth_tok_emb_dev;
+        } else {
+            last_tok_slot = borrow_staging(ctx.staging);
+            last_tok_host = (float *) last_tok_slot.host;
+            last_tok_dev = last_tok_slot.dev;
+        }
+        auto unpack_emb_row = [](const ggml_tensor * t, int32_t tok, float * dst, int64_t dim) {
+            if (!t || !t->data || tok < 0 || tok >= t->ne[1]) {
+                std::memset(dst, 0, (size_t) dim * sizeof(float));
+                return;
+            }
+            const uint8_t * row = (const uint8_t *) t->data + (size_t) tok * t->nb[1];
+            if (t->type == GGML_TYPE_F32) {
+                std::memcpy(dst, row, (size_t) dim * sizeof(float));
+            } else if (t->type == GGML_TYPE_F16) {
+                const ggml_fp16_t * h = (const ggml_fp16_t *) row;
+                for (int64_t d = 0; d < dim; ++d) dst[d] = ggml_fp16_to_fp32(h[d]);
+            } else {
+                const struct ggml_type_traits * traits = ggml_get_type_traits(t->type);
+                if (traits && traits->to_float) {
+                    traits->to_float(row, dst, dim);
+                } else {
+                    std::memset(dst, 0, (size_t) dim * sizeof(float));
+                }
+            }
+        };
+
         if (codebook_step == 0) {
             int32_t tok_id = *(const int32_t *) text_tokens->data;
-            const float * row = (const float *) ((const uint8_t *) model.text_emb->data + (size_t) tok_id * model.text_emb->nb[1]);
-            std::memcpy(last_tok_host, row, 1024 * sizeof(float));
+            unpack_emb_row(model.text_emb, tok_id, last_tok_host, 1024);
         } else {
             int32_t tok_id = *(const int32_t *) audio_tokens->data;
-            const float * row = (const float *) ((const uint8_t *) model.audio_embs[(size_t) (codebook_step - 1)]->data + (size_t) tok_id * model.audio_embs[(size_t) (codebook_step - 1)]->nb[1]);
-            std::memcpy(last_tok_host, row, 1024 * sizeof(float));
+            unpack_emb_row(model.audio_embs[(size_t) (codebook_step - 1)], tok_id, last_tok_host, 1024);
         }
         ggml_tensor * last_tok = ggml_new_tensor_1d(wctx, GGML_TYPE_F32, 1024);
         last_tok->data = last_tok_host;
-        last_tok->extra = last_tok_slot.dev;
+        last_tok->extra = last_tok_dev;
         last_tok_slot.pool = nullptr;
         x = apply_residual_gpu(ctx, wctx, z_s, last_tok);
     } else
@@ -2951,7 +2980,7 @@ ggml_cgraph * bmo_build_depth_graph(
                     ctx.depth_v_cache->extra,
                     (float *) attn_slot.dev,
                     ctx.depth_head_dim, ctx.depth_n_heads, ctx.depth_n_heads, ctx.depth_n_ctx,
-                    codebook_step, i, nullptr);
+                    codebook_step, i, ctx.stream, nullptr);
                 attn_slot.pool = nullptr;
                 ggml_tensor * attn_3d = ggml_new_tensor_3d(wctx, GGML_TYPE_F32, ctx.depth_head_dim, ctx.depth_n_heads, 1);
                 attn_3d->data = attn_slot.host;

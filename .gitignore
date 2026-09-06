@@ -22,3 +22,5 @@ llama.cpp
 # System files
 .DS_Store
 Thumbs.db
+__pycache__/
+output_bmo_response.wav

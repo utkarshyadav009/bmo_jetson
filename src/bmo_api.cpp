@@ -1,11 +1,6 @@
-// bmo_api.cpp - Implementation of the BMO C-ABI bridge.
-//
-// Wraps bmo_model + bmo_context behind an opaque handle and serialises all
-// per-handle entry points through a mutex so the resulting libbmo.so can be
-// safely shared across Python threads.
+// bmo_api.cpp - Implementation of the BMO C-ABI bridge with CUDA Graph acceleration.
 
 #include "bmo_api.h"
-
 #include "bmo.h"
 #include "ggml.h"
 
@@ -18,12 +13,50 @@
 #include <string>
 #include <vector>
 
+#ifdef BMO_ENABLE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 struct bmo_handle {
     bmo_model   model;
     bmo_context ctx;
     int         pos = 0;
     std::string last_error;
     std::mutex  mu;
+
+#ifdef BMO_ENABLE_CUDA
+    cudaStream_t stream = nullptr;
+
+    // Device-mapped int pointer for dynamic pos
+    int * pos_host = nullptr;
+    int * pos_dev = nullptr;
+
+    // Temporal static pinned buffers
+    float * temporal_in_host = nullptr;
+    float * temporal_in_dev = nullptr;
+    float * transformer_out_host = nullptr;
+    float * transformer_out_dev = nullptr;
+    float * text_logits_host = nullptr;
+    float * text_logits_dev = nullptr;
+
+    // Temporal graph
+    cudaGraph_t temporal_graph = nullptr;
+    cudaGraphExec_t temporal_graph_exec = nullptr;
+    bool temporal_captured = false;
+
+    // Depth static pinned buffers
+    float * depth_temporal_in_host = nullptr;
+    float * depth_temporal_in_dev = nullptr;
+    float * depth_tok_emb_host = nullptr;
+    float * depth_tok_emb_dev = nullptr;
+    float * depth_audio_logits_host[8] = {nullptr};
+    float * depth_audio_logits_dev[8] = {nullptr};
+
+    // Depth graphs
+    cudaGraph_t depth_graph[8] = {nullptr};
+    cudaGraphExec_t depth_graph_exec[8] = {nullptr};
+    bool depth_captured[8] = {false};
+#endif
 };
 
 namespace {
@@ -39,6 +72,27 @@ constexpr int32_t kDefaultKvCtx = 2048;
 
 void set_err(bmo_handle_t * h, const std::string & m) {
     if (h) h->last_error = m;
+}
+
+static void unpack_emb_row(const ggml_tensor * t, int32_t tok, float * dst, int64_t dim) {
+    if (!t || !t->data || tok < 0 || tok >= t->ne[1]) {
+        std::memset(dst, 0, (size_t) dim * sizeof(float));
+        return;
+    }
+    const uint8_t * row = (const uint8_t *) t->data + (size_t) tok * t->nb[1];
+    if (t->type == GGML_TYPE_F32) {
+        std::memcpy(dst, row, (size_t) dim * sizeof(float));
+    } else if (t->type == GGML_TYPE_F16) {
+        const ggml_fp16_t * h = (const ggml_fp16_t *) row;
+        for (int64_t d = 0; d < dim; ++d) dst[d] = ggml_fp16_to_fp32(h[d]);
+    } else {
+        const struct ggml_type_traits * traits = ggml_get_type_traits(t->type);
+        if (traits && traits->to_float) {
+            traits->to_float(row, dst, dim);
+        } else {
+            std::memset(dst, 0, (size_t) dim * sizeof(float));
+        }
+    }
 }
 
 } // namespace
@@ -78,6 +132,18 @@ bmo_handle_t * bmo_init(const char * gguf_path, int n_ctx) {
                 hh->model.gctx = nullptr;
             }
             bmo_free_cuda_resources(hh->ctx);
+#ifdef BMO_ENABLE_CUDA
+            if (hh->stream) cudaStreamDestroy(hh->stream);
+            if (hh->pos_host) cudaFreeHost(hh->pos_host);
+            if (hh->temporal_in_host) cudaFreeHost(hh->temporal_in_host);
+            if (hh->transformer_out_host) cudaFreeHost(hh->transformer_out_host);
+            if (hh->text_logits_host) cudaFreeHost(hh->text_logits_host);
+            if (hh->depth_temporal_in_host) cudaFreeHost(hh->depth_temporal_in_host);
+            if (hh->depth_tok_emb_host) cudaFreeHost(hh->depth_tok_emb_host);
+            for (int s = 0; s < 8; ++s) {
+                if (hh->depth_audio_logits_host[s]) cudaFreeHost(hh->depth_audio_logits_host[s]);
+            }
+#endif
         } catch (...) {
             // best-effort cleanup; never throw from the failure path
         }
@@ -86,13 +152,45 @@ bmo_handle_t * bmo_init(const char * gguf_path, int n_ctx) {
     try {
         bmo_load_model(gguf_path, h->model, h->ctx);
 
-        // bmo_init_kv_cache takes (ctx, n_ctx) -- the n_ctx caller value is
-        // clamped internally on Jetson.
         const int32_t kv_ctx = (n_ctx > 0) ? (int32_t) n_ctx : kDefaultKvCtx;
         bmo_init_kv_cache(h->ctx, kv_ctx);
 
         h->ctx.work_mem.resize(kDefaultWorkMem);
         h->pos = 0;
+
+#ifdef BMO_ENABLE_CUDA
+        cudaStreamCreateWithFlags(&h->stream, cudaStreamNonBlocking);
+        h->ctx.stream = h->stream;
+
+        cudaHostAlloc((void **) &h->pos_host, sizeof(int), cudaHostAllocMapped);
+        cudaHostGetDevicePointer((void **) &h->pos_dev, h->pos_host, 0);
+        *h->pos_host = 0;
+        h->ctx.pos_dev = h->pos_dev;
+
+        // Pinned buffers for temporal
+        cudaHostAlloc((void **) &h->temporal_in_host, (size_t) h->ctx.n_embd * sizeof(float), cudaHostAllocMapped);
+        cudaHostGetDevicePointer((void **) &h->temporal_in_dev, h->temporal_in_host, 0);
+
+        cudaHostAlloc((void **) &h->transformer_out_host, (size_t) h->ctx.n_embd * sizeof(float), cudaHostAllocMapped);
+        cudaHostGetDevicePointer((void **) &h->transformer_out_dev, h->transformer_out_host, 0);
+
+        cudaHostAlloc((void **) &h->text_logits_host, (size_t) h->ctx.text_vocab_size * sizeof(float), cudaHostAllocMapped);
+        cudaHostGetDevicePointer((void **) &h->text_logits_dev, h->text_logits_host, 0);
+
+        // Pinned buffers for depth
+        cudaHostAlloc((void **) &h->depth_temporal_in_host, (size_t) h->ctx.n_embd * sizeof(float), cudaHostAllocMapped);
+        cudaHostGetDevicePointer((void **) &h->depth_temporal_in_dev, h->depth_temporal_in_host, 0);
+
+        cudaHostAlloc((void **) &h->depth_tok_emb_host, 1024 * sizeof(float), cudaHostAllocMapped);
+        cudaHostGetDevicePointer((void **) &h->depth_tok_emb_dev, h->depth_tok_emb_host, 0);
+        h->ctx.depth_tok_emb_host = h->depth_tok_emb_host;
+        h->ctx.depth_tok_emb_dev = h->depth_tok_emb_dev;
+
+        for (int s = 0; s < 8; ++s) {
+            cudaHostAlloc((void **) &h->depth_audio_logits_host[s], (size_t) h->ctx.audio_vocab_size * sizeof(float), cudaHostAllocMapped);
+            cudaHostGetDevicePointer((void **) &h->depth_audio_logits_dev[s], h->depth_audio_logits_host[s], 0);
+        }
+#endif
     } catch (const std::exception & ex) {
         std::fprintf(stderr, "[bmo_api] init failed: %s\n", ex.what());
         init_cleanup(h.get());
@@ -109,6 +207,22 @@ bmo_handle_t * bmo_init(const char * gguf_path, int n_ctx) {
 void bmo_free(bmo_handle_t * h) {
     if (!h) return;
     try {
+#ifdef BMO_ENABLE_CUDA
+        if (h->temporal_graph_exec) cudaGraphExecDestroy(h->temporal_graph_exec);
+        if (h->temporal_graph) cudaGraphDestroy(h->temporal_graph);
+        for (int s = 0; s < 8; ++s) {
+            if (h->depth_graph_exec[s]) cudaGraphExecDestroy(h->depth_graph_exec[s]);
+            if (h->depth_graph[s]) cudaGraphDestroy(h->depth_graph[s]);
+            if (h->depth_audio_logits_host[s]) cudaFreeHost(h->depth_audio_logits_host[s]);
+        }
+        if (h->depth_tok_emb_host) cudaFreeHost(h->depth_tok_emb_host);
+        if (h->depth_temporal_in_host) cudaFreeHost(h->depth_temporal_in_host);
+        if (h->text_logits_host) cudaFreeHost(h->text_logits_host);
+        if (h->transformer_out_host) cudaFreeHost(h->transformer_out_host);
+        if (h->temporal_in_host) cudaFreeHost(h->temporal_in_host);
+        if (h->pos_host) cudaFreeHost(h->pos_host);
+        if (h->stream) cudaStreamDestroy(h->stream);
+#endif
         if (h->ctx.work_ctx) {
             ggml_free(h->ctx.work_ctx);
             h->ctx.work_ctx = nullptr;
@@ -142,6 +256,9 @@ void bmo_reset(bmo_handle_t * h) {
     if (!h) return;
     std::lock_guard<std::mutex> lk(h->mu);
     h->pos = 0;
+#ifdef BMO_ENABLE_CUDA
+    if (h->pos_host) *h->pos_host = 0;
+#endif
     if (h->ctx.k_cache && h->ctx.k_cache->data) {
         std::memset(h->ctx.k_cache->data, 0, (size_t) ggml_nbytes(h->ctx.k_cache));
     }
@@ -157,6 +274,174 @@ int bmo_get_n_codebooks (bmo_handle_t * h) { return h ? h->ctx.num_codebooks    
 int bmo_get_dep_q       (bmo_handle_t * h) { return h ? h->ctx.dep_q            : 0; }
 int bmo_get_text_vocab  (bmo_handle_t * h) { return h ? h->ctx.text_vocab_size  : 0; }
 int bmo_get_audio_vocab (bmo_handle_t * h) { return h ? h->ctx.audio_vocab_size : 0; }
+int bmo_get_n_attn_heads(bmo_handle_t * h) { return h ? h->ctx.n_heads          : 0; }
+int bmo_get_head_dim    (bmo_handle_t * h) { return h ? h->ctx.head_dim         : 0; }
+
+int bmo_copy_k_cache_f32(
+    bmo_handle_t * h,
+    int layer,
+    int t_start,
+    int n_positions,
+    float * out,
+    int max_floats) {
+    if (!h || !out || n_positions <= 0 || max_floats <= 0) {
+        return -1;
+    }
+    if (!h->ctx.k_cache || !h->ctx.k_cache->data) {
+        return -1;
+    }
+    if (h->ctx.k_cache->type != GGML_TYPE_F16) {
+        return -1;
+    }
+    const int n_heads = (int) h->ctx.n_heads;
+    const int head_dim = (int) h->ctx.head_dim;
+    const int n_ctx = (int) h->ctx.k_cache->ne[1];
+    if (layer < 0 || layer >= (int) h->ctx.n_layers || n_heads <= 0 || head_dim <= 0) {
+        return -3;
+    }
+    if (t_start < 0 || t_start + n_positions > n_ctx) {
+        return -3;
+    }
+    const int64_t need = (int64_t) n_positions * (int64_t) n_heads * (int64_t) head_dim;
+    if (need > (int64_t) max_floats) {
+        return -2;
+    }
+
+    std::lock_guard<std::mutex> lk(h->mu);
+
+    const ggml_fp16_t * k_cache_data = (const ggml_fp16_t *) h->ctx.k_cache->data;
+    const size_t per_layer =
+        (size_t) head_dim * (size_t) n_ctx * (size_t) h->ctx.n_heads;
+    const size_t per_head = (size_t) head_dim * (size_t) n_ctx;
+
+    int w = 0;
+    for (int ti = 0; ti < n_positions; ++ti) {
+        const int p = t_start + ti;
+        for (int hh = 0; hh < n_heads; ++hh) {
+            const size_t cache_row_base =
+                (size_t) layer * per_layer + (size_t) hh * per_head + (size_t) p * (size_t) head_dim;
+            for (int d = 0; d < head_dim; ++d) {
+                out[w++] = ggml_fp16_to_fp32(k_cache_data[cache_row_base + (size_t) d]);
+            }
+        }
+    }
+    return w;
+}
+
+int bmo_capture_graphs(bmo_handle_t * h) {
+    if (!h) return 1;
+#ifndef BMO_ENABLE_CUDA
+    return 1;
+#else
+    std::lock_guard<std::mutex> lk(h->mu);
+    try {
+        std::fprintf(stderr, "[bmo_api] Warming up and capturing CUDA Graphs...\n");
+
+        // 1. Warm run outside capture to ensure all device pointers (weights, buffers) are populated
+        std::vector<int32_t> warm_tokens(h->ctx.num_codebooks, 0);
+        warm_tokens[0] = 3;
+        bmo_reset_work_ctx(h->ctx);
+        ggml_tensor * layer_in = bmo_embed_input_tokens(h->ctx, h->model, warm_tokens.data(), h->ctx.num_codebooks);
+        ggml_cgraph * gf_warm = bmo_build_temporal_graph(h->ctx, h->model, layer_in, 0, 0, h->ctx.n_layers);
+        bmo_execute_graph(h->ctx, gf_warm, {}, true);
+
+        for (int s = 0; s < h->ctx.dep_q; ++s) {
+            bmo_reset_work_ctx(h->ctx);
+            ggml_tensor * t_in = ggml_new_tensor_2d(h->ctx.work_ctx, GGML_TYPE_F32, h->ctx.n_embd, 1);
+            ggml_tensor * txt = ggml_new_tensor_1d(h->ctx.work_ctx, GGML_TYPE_I32, 1);
+            ggml_tensor * aud = ggml_new_tensor_1d(h->ctx.work_ctx, GGML_TYPE_I32, 1);
+            *(int32_t*)txt->data = 0;
+            *(int32_t*)aud->data = 0;
+            ggml_cgraph * d_gf = bmo_build_depth_graph(h->ctx, h->model, t_in, txt, aud, s, 0);
+            bmo_execute_graph(h->ctx, d_gf, {}, true);
+        }
+        cudaStreamSynchronize(h->stream);
+
+        // 2. Capture Temporal Graph
+        bmo_reset_work_ctx(h->ctx);
+        ggml_tensor * temp_in = ggml_new_tensor_2d(h->ctx.work_ctx, GGML_TYPE_F32, h->ctx.n_embd, 1);
+        temp_in->data = h->temporal_in_host;
+        temp_in->extra = h->temporal_in_dev;
+
+        cudaStreamBeginCapture(h->stream, cudaStreamCaptureModeThreadLocal);
+        ggml_cgraph * t_gf = bmo_build_temporal_graph(h->ctx, h->model, temp_in, 0, 0, h->ctx.n_layers);
+        ggml_tensor * t_out = ggml_graph_get_tensor(t_gf, "transformer_out");
+        ggml_tensor * t_lgt = ggml_graph_get_tensor(t_gf, "text_logits");
+        if (t_out && t_out->extra && t_out->extra != h->transformer_out_dev) {
+            cudaMemcpyAsync(h->transformer_out_dev, t_out->extra, (size_t) h->ctx.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, h->stream);
+        }
+        if (t_lgt && t_lgt->extra && t_lgt->extra != h->text_logits_dev) {
+            cudaMemcpyAsync(h->text_logits_dev, t_lgt->extra, (size_t) h->ctx.text_vocab_size * sizeof(float), cudaMemcpyDeviceToDevice, h->stream);
+        }
+        cudaError_t t_err = cudaStreamEndCapture(h->stream, &h->temporal_graph);
+        if (t_err == cudaSuccess) {
+            cudaError_t inst_err = cudaGraphInstantiate(&h->temporal_graph_exec, h->temporal_graph, nullptr, nullptr, 0);
+            if (inst_err == cudaSuccess) {
+                h->temporal_captured = true;
+            } else {
+                std::fprintf(stderr, "[bmo_api] Temporal graph instantiate failed: %s\n", cudaGetErrorString(inst_err));
+            }
+        } else {
+            std::fprintf(stderr, "[bmo_api] Temporal graph capture failed: %s\n", cudaGetErrorString(t_err));
+        }
+
+        // 3. Capture 8 Depth Graphs
+        bool all_depth = true;
+        for (int s = 0; s < h->ctx.dep_q; ++s) {
+            bmo_reset_work_ctx(h->ctx);
+            ggml_tensor * t_in = ggml_new_tensor_2d(h->ctx.work_ctx, GGML_TYPE_F32, h->ctx.n_embd, 1);
+            t_in->data = h->depth_temporal_in_host;
+            t_in->extra = h->depth_temporal_in_dev;
+
+            ggml_tensor * txt = ggml_new_tensor_1d(h->ctx.work_ctx, GGML_TYPE_I32, 1);
+            ggml_tensor * aud = ggml_new_tensor_1d(h->ctx.work_ctx, GGML_TYPE_I32, 1);
+            *(int32_t*)txt->data = 0;
+            *(int32_t*)aud->data = 0;
+
+            cudaStreamBeginCapture(h->stream, cudaStreamCaptureModeThreadLocal);
+            ggml_cgraph * d_gf = bmo_build_depth_graph(h->ctx, h->model, t_in, txt, aud, s, 0);
+            ggml_tensor * d_lgt = ggml_graph_get_tensor(d_gf, "audio_logits");
+            if (d_lgt && d_lgt->extra && d_lgt->extra != h->depth_audio_logits_dev[s]) {
+                cudaMemcpyAsync(h->depth_audio_logits_dev[s], d_lgt->extra, (size_t) h->ctx.audio_vocab_size * sizeof(float), cudaMemcpyDeviceToDevice, h->stream);
+            }
+            cudaError_t d_err = cudaStreamEndCapture(h->stream, &h->depth_graph[s]);
+            if (d_err == cudaSuccess) {
+                cudaError_t inst_err = cudaGraphInstantiate(&h->depth_graph_exec[s], h->depth_graph[s], nullptr, nullptr, 0);
+                if (inst_err == cudaSuccess) {
+                    h->depth_captured[s] = true;
+                } else {
+                    std::fprintf(stderr, "[bmo_api] Depth step %d instantiate failed: %s\n", s, cudaGetErrorString(inst_err));
+                    all_depth = false;
+                }
+            } else {
+                std::fprintf(stderr, "[bmo_api] Depth step %d capture failed: %s\n", s, cudaGetErrorString(d_err));
+                all_depth = false;
+            }
+        }
+
+        std::fprintf(stderr, "[bmo_api] Captured CUDA Graphs: Temporal=%s, Depth(8)=%s\n",
+                     h->temporal_captured ? "SUCCESS" : "FAILED",
+                     all_depth ? "SUCCESS" : "FAILED");
+        return (h->temporal_captured && all_depth) ? 0 : 2;
+    } catch (const std::exception & ex) {
+        set_err(h, ex.what());
+        return 9;
+    }
+#endif
+}
+
+int bmo_has_cuda_graphs(bmo_handle_t * h) {
+#ifdef BMO_ENABLE_CUDA
+    if (!h) return 0;
+    bool all_depth = true;
+    for (int s = 0; s < h->ctx.dep_q; ++s) {
+        if (!h->depth_captured[s]) all_depth = false;
+    }
+    return (h->temporal_captured && all_depth) ? 1 : 0;
+#else
+    return 0;
+#endif
+}
 
 const char * bmo_last_error(bmo_handle_t * h) {
     return (!h || h->last_error.empty()) ? nullptr : h->last_error.c_str();
@@ -214,6 +499,30 @@ int bmo_forward_temporal2(
 
     std::lock_guard<std::mutex> lk(h->mu);
     try {
+#ifdef BMO_ENABLE_CUDA
+        // Accelerated path: CUDA Graph execution
+        if (h->temporal_captured && n_capture_layers == 0) {
+            bmo_embed_input_tokens_into(h->ctx, h->model, input_tokens, num_codebooks, h->temporal_in_host);
+            *h->pos_host = pos;
+
+            cudaGraphLaunch(h->temporal_graph_exec, h->stream);
+            cudaStreamSynchronize(h->stream);
+
+            const size_t hidden_bytes = (size_t) h->ctx.n_embd * sizeof(float);
+            const size_t logits_bytes = (size_t) h->ctx.text_vocab_size * sizeof(float);
+
+            std::memcpy(out_transformer, h->transformer_out_host, hidden_bytes);
+            std::memcpy(out_text_logits, h->text_logits_host, logits_bytes);
+
+            // Statically copy transformer_out into depth input so depth steps can immediately read it
+            std::memcpy(h->depth_temporal_in_host, h->transformer_out_host, hidden_bytes);
+
+            h->pos = pos + 1;
+            h->last_error.clear();
+            return 0;
+        }
+#endif
+
         bmo_reset_work_ctx(h->ctx);
 
         ggml_tensor * layer_in = bmo_embed_input_tokens(
@@ -304,6 +613,40 @@ int bmo_forward_depth(
 
     std::lock_guard<std::mutex> lk(h->mu);
     try {
+#ifdef BMO_ENABLE_CUDA
+        if (h->depth_captured[cb_index]) {
+            if (cb_index == 0) {
+                if (h->ctx.depth_k_cache && h->ctx.depth_k_cache->extra) {
+                    cudaMemsetAsync(h->ctx.depth_k_cache->extra, 0, (size_t) ggml_nbytes(h->ctx.depth_k_cache), h->stream);
+                }
+                if (h->ctx.depth_v_cache && h->ctx.depth_v_cache->extra) {
+                    cudaMemsetAsync(h->ctx.depth_v_cache->extra, 0, (size_t) ggml_nbytes(h->ctx.depth_v_cache), h->stream);
+                }
+            }
+
+            // Copy transformer_out to depth_temporal_in if caller passed a different pointer
+            const size_t hidden_bytes = (size_t) h->ctx.n_embd * sizeof(float);
+            if (transformer_out != h->depth_temporal_in_host) {
+                std::memcpy(h->depth_temporal_in_host, transformer_out, hidden_bytes);
+            }
+
+            // Unpack prev_token's embedding directly into the dedicated depth_tok_emb_host
+            if (cb_index == 0) {
+                unpack_emb_row(h->model.text_emb, prev_token, h->depth_tok_emb_host, 1024);
+            } else {
+                unpack_emb_row(h->model.audio_embs[(size_t) (cb_index - 1)], prev_token, h->depth_tok_emb_host, 1024);
+            }
+
+            cudaGraphLaunch(h->depth_graph_exec[cb_index], h->stream);
+            cudaStreamSynchronize(h->stream);
+
+            const size_t want_bytes = (size_t) h->ctx.audio_vocab_size * sizeof(float);
+            std::memcpy(out_audio_logits, h->depth_audio_logits_host[cb_index], want_bytes);
+            h->last_error.clear();
+            return 0;
+        }
+#endif
+
         // 1. Reset the depth KV cache at the start of every new temporal frame.
         if (cb_index == 0) {
             bmo_reset_depth_kv(h->ctx);
@@ -319,9 +662,7 @@ int bmo_forward_depth(
             return 3;
         }
 
-        // 3. Build host-side leaf tensors. bmo_build_depth_graph is happy to
-        //    consume tensors that already have ->data populated; we just need
-        //    them to live in the work arena so the graph executor finds them.
+        // 3. Build host-side leaf tensors.
         const int n_embd = h->ctx.n_embd;
         ggml_tensor * temporal_in = ggml_new_tensor_2d(wctx, GGML_TYPE_F32, n_embd, 1);
         if (!temporal_in || !temporal_in->data) {
@@ -330,12 +671,6 @@ int bmo_forward_depth(
         }
         std::memcpy(temporal_in->data, transformer_out, (size_t) n_embd * sizeof(float));
 
-        // text_tokens / audio_tokens are both single-element I32 leaves so
-        // bmo_build_depth_graph's per-codebook embedding lookup
-        //   (cb_index == 0 -> text_emb[prev_token],
-        //    cb_index >  0 -> audio_embs[cb_index - 1][prev_token])
-        // can read whichever one matches the current step. We populate both
-        // with prev_token; only one is dereferenced per call.
         ggml_tensor * text_tokens  = ggml_new_tensor_1d(wctx, GGML_TYPE_I32, 1);
         ggml_tensor * audio_tokens = ggml_new_tensor_1d(wctx, GGML_TYPE_I32, 1);
         if (!text_tokens || !text_tokens->data || !audio_tokens || !audio_tokens->data) {
@@ -345,8 +680,7 @@ int bmo_forward_depth(
         *((int32_t *) text_tokens->data)  = prev_token;
         *((int32_t *) audio_tokens->data) = prev_token;
 
-        // 4. Build and execute the depth graph. n_past is unused inside the
-        //    builder (depth attention indexes by codebook_step), so we pass 0.
+        // 4. Build and execute the depth graph.
         ggml_cgraph * gf = bmo_build_depth_graph(
             h->ctx, h->model, temporal_in, text_tokens, audio_tokens,
             /*codebook_step=*/cb_index, /*n_past=*/0);

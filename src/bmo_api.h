@@ -53,6 +53,23 @@ BMO_API int bmo_get_n_codebooks  (bmo_handle_t * h);
 BMO_API int bmo_get_dep_q        (bmo_handle_t * h);
 BMO_API int bmo_get_text_vocab   (bmo_handle_t * h);
 BMO_API int bmo_get_audio_vocab  (bmo_handle_t * h);
+BMO_API int bmo_get_n_attn_heads (bmo_handle_t * h);
+BMO_API int bmo_get_head_dim     (bmo_handle_t * h);
+
+// Copies a slice of the temporal K-cache out as float32.
+// Returns the number of floats written, or negative on error.
+BMO_API int bmo_copy_k_cache_f32(
+    bmo_handle_t * h,
+    int layer,
+    int t_start,
+    int n_positions,
+    float * out,
+    int max_floats);
+
+// Captures CUDA graphs for the temporal and depth passes.
+// Returns 0 on success, non-zero on failure.
+BMO_API int bmo_capture_graphs(bmo_handle_t * h);
+BMO_API int bmo_has_cuda_graphs(bmo_handle_t * h);
 
 // Runs the temporal transformer for a single decode step.
 //

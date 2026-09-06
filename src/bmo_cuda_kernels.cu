@@ -320,7 +320,8 @@ __global__ void rope_interleaved_kernel(
     const float * __restrict__ x,
     int n_heads, int head_dim, int n_token,
     int pos_base, float theta_base,
-    float * __restrict__ y) {
+    float * __restrict__ y,
+    const int * __restrict__ pos_dev = nullptr) {
     const int head = blockIdx.x;
     const int token = blockIdx.y;
     const int tid = threadIdx.x;
@@ -331,7 +332,8 @@ __global__ void rope_interleaved_kernel(
     const float * x_head = x + off_in_tensor;
     float * y_head = y + off_in_tensor;
 
-    const int pos = pos_base + token;
+    const int effective_pos = (pos_dev != nullptr) ? (*pos_dev) : pos_base;
+    const int pos = effective_pos + token;
 
     for (int i = tid; i < half; i += blockDim.x) {
         const float exponent = (float) (2 * i) / (float) head_dim;
@@ -356,12 +358,13 @@ void launch_rope_interleaved(
     int n_heads, int head_dim, int n_token,
     int pos_base, float theta_base,
     float * y_dev,
-    void * stream) {
+    void * stream,
+    const int * pos_dev) {
     const int threads = std::min(64, head_dim / 2);
     dim3 grid((unsigned) n_heads, (unsigned) n_token);
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
     rope_interleaved_kernel<<<grid, threads, 0, s>>>(
-        x_dev, n_heads, head_dim, n_token, pos_base, theta_base, y_dev);
+        x_dev, n_heads, head_dim, n_token, pos_base, theta_base, y_dev, pos_dev);
 }
 
 // SwiGLU on a split [gate | up] vector: y[i] = silu(gate[i]) * up[i].
@@ -511,6 +514,14 @@ static __device__ __forceinline__ float bmo_warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
         val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+    }
+    return val;
+}
+
+static __device__ __forceinline__ float bmo_warp_reduce_max(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
     }
     return val;
 }
@@ -712,7 +723,8 @@ __global__ void bmo_decode_attention_kernel(
     int n_ctx,
     int n_past,
     int layer,
-    float scale
+    float scale,
+    const int * __restrict__ pos_dev = nullptr
 ) {
     const int h = blockIdx.x;
     if (h >= n_heads) return;
@@ -720,12 +732,13 @@ __global__ void bmo_decode_attention_kernel(
     const int tid = threadIdx.x;
     if (tid >= head_dim) return;
 
+    const int effective_past = (pos_dev != nullptr) ? (*pos_dev) : n_past;
     const int q_per_kv = (n_kv_heads > 0) ? (n_heads / n_kv_heads) : 1;
     const int kv_h = (n_kv_heads == n_heads) ? h : (h / q_per_kv);
 
     const size_t per_layer = (size_t) head_dim * (size_t) n_ctx * (size_t) n_heads;
     const size_t per_head  = (size_t) head_dim * (size_t) n_ctx;
-    const size_t cache_offset = (size_t) layer * per_layer + (size_t) h * per_head + (size_t) n_past * (size_t) head_dim;
+    const size_t cache_offset = (size_t) layer * per_layer + (size_t) h * per_head + (size_t) effective_past * (size_t) head_dim;
 
     // Step 1: Write current K and V to cache
     if (h < n_kv_heads) {
@@ -734,7 +747,7 @@ __global__ void bmo_decode_attention_kernel(
     }
     __syncthreads();
 
-    const int kv_len = n_past + 1;
+    const int kv_len = effective_past + 1;
 
     // Fast path: kv_len == 1
     if (kv_len == 1) {
@@ -771,21 +784,49 @@ __global__ void bmo_decode_attention_kernel(
         __syncthreads();
     }
 
+    // Parallel softmax reduction across all 128 threads in block
+    float local_max = -1e20f;
+    for (int t = tid; t < kv_len; t += blockDim.x) {
+        if (s_scores[t] > local_max) local_max = s_scores[t];
+    }
+    local_max = bmo_warp_reduce_max(local_max);
+    if (lane_id == 0) {
+        s_warp[warp_id] = local_max;
+    }
+    __syncthreads();
     if (tid == 0) {
-        float max_s = s_scores[0];
-        for (int t = 1; t < kv_len; ++t) {
-            if (s_scores[t] > max_s) max_s = s_scores[t];
+        float m = s_warp[0];
+        for (int w = 1; w < num_warps; ++w) {
+            if (s_warp[w] > m) m = s_warp[w];
         }
+        s_warp[0] = m;
+    }
+    __syncthreads();
+    const float max_s = s_warp[0];
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < kv_len; t += blockDim.x) {
+        float e = expf(s_scores[t] - max_s);
+        s_scores[t] = e;
+        local_sum += e;
+    }
+    local_sum = bmo_warp_reduce_sum(local_sum);
+    if (lane_id == 0) {
+        s_warp[warp_id] = local_sum;
+    }
+    __syncthreads();
+    if (tid == 0) {
         float sum_e = 0.0f;
-        for (int t = 0; t < kv_len; ++t) {
-            float e = expf(s_scores[t] - max_s);
-            s_scores[t] = e;
-            sum_e += e;
+        for (int w = 0; w < num_warps; ++w) {
+            sum_e += s_warp[w];
         }
-        float inv_sum = (sum_e > 0.0f) ? (1.0f / sum_e) : 0.0f;
-        for (int t = 0; t < kv_len; ++t) {
-            s_scores[t] *= inv_sum;
-        }
+        s_warp[0] = (sum_e > 0.0f) ? (1.0f / sum_e) : 0.0f;
+    }
+    __syncthreads();
+    const float inv_sum = s_warp[0];
+
+    for (int t = tid; t < kv_len; t += blockDim.x) {
+        s_scores[t] *= inv_sum;
     }
     __syncthreads();
 
@@ -811,7 +852,8 @@ void launch_decode_attention(
     int n_ctx,
     int n_past,
     int layer,
-    void * stream) {
+    void * stream,
+    const int * pos_dev) {
 
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
     float scale = 1.0f / sqrtf((float) head_dim);
@@ -829,5 +871,6 @@ void launch_decode_attention(
         n_ctx,
         n_past,
         layer,
-        scale);
+        scale,
+        pos_dev);
 }
