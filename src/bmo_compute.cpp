@@ -2957,24 +2957,14 @@ ggml_cgraph * bmo_build_depth_graph(
                 v_raw->extra = (uint8_t *) qkv->extra + (size_t) (q_dim + kv_dim) * e;
             }
 
-            ggml_tensor * pos = ggml_new_tensor_1d(wctx, GGML_TYPE_I32, n_token);
-            std::vector<int32_t> pos_host((size_t) n_token);
-            for (int64_t t = 0; t < n_token; ++t) {
-                pos_host[(size_t) t] = (int32_t) n_past + (int32_t) t;
-            }
-            stage_tensor_upload(ctx, pos, pos_host.data(), (size_t) n_token * sizeof(int32_t));
-
-            ggml_tensor * q_rope = apply_rope_gpu_interleaved(ctx, wctx, q_raw, pos);
-            ggml_tensor * k_rope = apply_rope_gpu_interleaved(ctx, wctx, k_raw, pos);
-
             ggml_tensor * attn_2d = nullptr;
 #ifdef BMO_JETSON
             if (ctx.depth_k_cache && ctx.depth_k_cache->extra && ctx.depth_v_cache && ctx.depth_v_cache->extra &&
-                q_rope && q_rope->extra && k_rope && k_rope->extra && v_raw && v_raw->extra) {
+                q_raw && q_raw->extra && k_raw && k_raw->extra && v_raw && v_raw->extra) {
                 staging_slot attn_slot = borrow_staging(ctx.staging);
                 launch_decode_attention(
-                    (const float *) q_rope->extra,
-                    (const float *) k_rope->extra,
+                    (const float *) q_raw->extra,
+                    (const float *) k_raw->extra,
                     (const float *) v_raw->extra,
                     ctx.depth_k_cache->extra,
                     ctx.depth_v_cache->extra,
@@ -2988,15 +2978,15 @@ ggml_cgraph * bmo_build_depth_graph(
                 attn_2d = ggml_reshape_2d(wctx, attn_3d, hidden_dim, n_token);
                 attn_2d->extra = attn_3d->extra;
             } else {
-                cudaStreamSynchronize(0); // Ensure RoPE / QKV kernels finished before CPU attention
+                cudaStreamSynchronize(0); // Ensure QKV kernels finished before CPU attention
                 ggml_tensor * attn_3d = apply_depth_attention_eager(
-                    ctx, wctx, q_rope, k_rope, v_raw, codebook_step, i);
+                    ctx, wctx, q_raw, k_raw, v_raw, codebook_step, i);
                 attn_2d = ggml_reshape_2d(wctx, attn_3d, hidden_dim, n_token);
                 attn_2d->extra = attn_3d->extra;
             }
 #else
             ggml_tensor * attn_3d = apply_depth_attention_eager(
-                ctx, wctx, q_rope, k_rope, v_raw, codebook_step, i);
+                ctx, wctx, q_raw, k_raw, v_raw, codebook_step, i);
             attn_2d = ggml_reshape_2d(wctx, attn_3d, hidden_dim, n_token);
 #endif
 
@@ -3119,28 +3109,12 @@ ggml_cgraph * bmo_build_depth_graph(
             ggml_build_forward_expand(gf, v_dbg);
         }
 
-        ggml_tensor * pos = ggml_new_tensor_1d(wctx, GGML_TYPE_I32, n_token);
-        std::vector<int32_t> pos_host((size_t) n_token);
-        for (int64_t t = 0; t < n_token; ++t) {
-            pos_host[(size_t) t] = (int32_t) n_past + (int32_t) t;
-        }
-        stage_tensor_upload(ctx, pos, pos_host.data(), (size_t) n_token * sizeof(int32_t));
-
-        // RoPE is intentionally kept on the LAZY ggml_rope path here, even on
-        // Jetson. The depth qkv tensor is produced by a lazy ggml_mul_mat
-        // whose ->data is only populated by ggml_graph_compute, so we must
-        // not consume q_raw/k_raw via the eager apply_rope_gpu_interleaved
-        // helper (which reads ->data at graph-build time and would see
-        // garbage / stale data). Letting the whole attention chain run in
-        // graph-compute order keeps everything consistent.
-        ggml_tensor * q_rope = ggml_rope(wctx, q_raw, pos, (int) head_dim, GGML_ROPE_TYPE_NORMAL);
-        ggml_tensor * k_rope = ggml_rope(wctx, k_raw, pos, (int) head_dim, GGML_ROPE_TYPE_NORMAL);
-
         // Permute (head_dim, n_heads, n_token) -> (head_dim, n_token, n_heads)
         // so the layout matches the depth KV cache view (ne[0]=head_dim,
         // ne[1]=n_token-or-cb_position, ne[2]=n_heads).
-        ggml_tensor * q_trans = ggml_permute(wctx, q_rope, 0, 2, 1, 3);
-        ggml_tensor * k_trans = ggml_permute(wctx, k_rope, 0, 2, 1, 3);
+        // Kyutai Moshi specifies depformer_pos_emb: "none", so no RoPE is applied.
+        ggml_tensor * q_trans = ggml_permute(wctx, q_raw, 0, 2, 1, 3);
+        ggml_tensor * k_trans = ggml_permute(wctx, k_raw, 0, 2, 1, 3);
         ggml_tensor * v_trans = ggml_permute(wctx, v_raw,  0, 2, 1, 3);
 
         // Cross-codebook depth KV cache. Written at slot codebook_step on

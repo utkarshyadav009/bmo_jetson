@@ -244,10 +244,11 @@ def main():
     underflow_count = 0
     overflow_count = 0
     callback_calls = 0
+    last_sample = 0.0
     stop_event = threading.Event()
 
     def output_callback(outdata, frames, time_info, status):
-        nonlocal underflow_count, callback_calls
+        nonlocal underflow_count, callback_calls, last_sample
         callback_calls += 1
         if status.output_underflow:
             underflow_count += 1
@@ -255,8 +256,14 @@ def main():
         try:
             pcm_out = output_queue.get_nowait()
             outdata[:, 0] = pcm_out
+            last_sample = float(pcm_out[-1])
         except queue.Empty:
-            outdata.fill(0)
+            if abs(last_sample) > 1e-4:
+                decay = np.linspace(last_sample, 0.0, frames, dtype=np.float32)
+                outdata[:, 0] = decay
+                last_sample = 0.0
+            else:
+                outdata.fill(0)
             underflow_count += 1
 
     in_stream = None
@@ -337,6 +344,8 @@ def main():
     turn_agent_speaking = False
     turnaround_latencies = []
     user_speech_end_time = 0.0
+    agent_rms = 0.0
+    user_silence_tokens = np.array([1049, 243, 783, 1562, 340, 2010, 183, 1665], dtype=np.int32)
     session_pcm_records = []
 
     start_rss = get_vram_mb()
@@ -361,25 +370,31 @@ def main():
 
                 t_frame_start = time.perf_counter()
 
-                # User audio energy check for turn turnaround tracking
+                # Acoustic echo suppression & Voice Activity Detection
                 user_rms = float(np.sqrt(np.mean(frame_chunk ** 2)))
-                is_user_speech = user_rms > 0.02
-                if is_user_speech and not turn_user_speaking:
-                    turn_user_speaking = True
-                    # If agent was speaking and user speaks: full-duplex interruption event!
-                    if turn_agent_speaking:
-                        print("\n  [INTERRUPTION] User speech detected over BMO output!")
-                elif not is_user_speech and turn_user_speaking:
-                    turn_user_speaking = False
-                    user_speech_end_time = time.perf_counter()
+                agent_active = turn_agent_speaking or (agent_rms > 0.012)
+                echo_threshold = max(0.045, 0.65 * agent_rms) if agent_active else 0.015
 
-                # Step A: Mimi Encode
-                t_chunk_gpu.copy_(torch.from_numpy(frame_chunk))
-                t_enc_0 = time.perf_counter()
-                user_codes = mimi.encode(t_chunk_gpu)
-                t_enc = (time.perf_counter() - t_enc_0) * 1000.0
+                is_user_speech = user_rms >= echo_threshold
 
-                user_tokens = user_codes[0, :, 0].detach().cpu().numpy().astype(np.int32)
+                if is_user_speech:
+                    if not turn_user_speaking:
+                        turn_user_speaking = True
+                        if turn_agent_speaking:
+                            print("\n  [INTERRUPTION] User speech detected over BMO output!")
+                    # Step A: Mimi Encode
+                    t_chunk_gpu.copy_(torch.from_numpy(frame_chunk))
+                    t_enc_0 = time.perf_counter()
+                    user_codes = mimi.encode(t_chunk_gpu)
+                    t_enc = (time.perf_counter() - t_enc_0) * 1000.0
+                    user_tokens = user_codes[0, :, 0].detach().cpu().numpy().astype(np.int32)
+                else:
+                    if turn_user_speaking:
+                        turn_user_speaking = False
+                        user_speech_end_time = time.perf_counter()
+                    t_enc = 0.0
+                    # Suppress speaker bleed / ambient noise with clean Mimi silence tokens
+                    user_tokens = user_silence_tokens.copy()
 
                 # Step B: 17-Token Interleave with Moshi delay invariant
                 if frame_count == 0:

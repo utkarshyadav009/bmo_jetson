@@ -664,6 +664,7 @@ int main(int argc, char ** argv) {
     auto t_start = std::chrono::high_resolution_clock::now();
     int frame_count = 0;
     bool user_is_speaking = false;
+    float last_agent_rms = 0.0f;
 
     while (g_running.load(std::memory_order_relaxed) && frame_count < total_frames) {
         // Step A: Audio Ingestion from Queue
@@ -679,34 +680,49 @@ int main(int argc, char ** argv) {
 
         auto t_f0 = std::chrono::high_resolution_clock::now();
 
-        // Live Voice Activity Indication
+        // Static silence tokens for Mimi
+        static const int32_t user_silence_tokens[8] = {1049, 243, 783, 1562, 340, 2010, 183, 1665};
+
+        // Live Voice Activity Indication & Echo Suppression
         float mic_rms = 0.0f;
         for (float s : h_chunk) mic_rms += s * s;
         mic_rms = std::sqrt(mic_rms / 1920.0f);
 
-        if (mic_rms > 0.008f) {
-            if (!user_is_speaking) {
-                user_is_speaking = true;
-                std::cout << "\n[🎙️  User Speaking...]\n";
-                std::cout.flush();
-            }
-        } else {
-            user_is_speaking = false;
-        }
+        bool agent_was_speaking = (prev_agent_text != 3 && prev_agent_text != 0 && prev_agent_text != 32000);
+        float echo_threshold = agent_was_speaking ? std::max(0.045f, 0.65f * last_agent_rms) : 0.015f;
 
-        cudaMemcpyAsync(d_pcm_in, h_chunk.data(), 1920 * sizeof(float), cudaMemcpyHostToDevice, stream);
-
-        // Step B: Mimi Encode (TensorRT FP16 SEANet + Fused RVQ)
-        auto t_enc0 = std::chrono::high_resolution_clock::now();
-        trt_enc.execute(d_pcm_in, d_enc_latent, stream);
-        bmo_rvq_encode(d_enc_latent, d_w_in0, d_e0, d_norm0, d_w_in_rest, d_e_rest, d_norm_rest,
-                       d_rvq_codes, d_rvq_scratch, stream);
-        cudaStreamSynchronize(stream);
-        auto t_enc1 = std::chrono::high_resolution_clock::now();
-        double ms_enc = std::chrono::duration<double, std::milli>(t_enc1 - t_enc0).count();
+        bool is_real_user_speech = (mic_rms >= echo_threshold);
 
         int32_t user_tokens[8];
-        cudaMemcpy(user_tokens, d_rvq_codes, 8 * sizeof(int32_t), cudaMemcpyDeviceToHost);
+        double ms_enc = 0.0;
+        if (is_real_user_speech) {
+            if (!user_is_speaking) {
+                user_is_speaking = true;
+                if (agent_was_speaking) {
+                    std::cout << "\n[🎙️  User Interruption!]\n";
+                } else {
+                    std::cout << "\n[🎙️  User Speaking...]\n";
+                }
+                std::cout.flush();
+            }
+
+            cudaMemcpyAsync(d_pcm_in, h_chunk.data(), 1920 * sizeof(float), cudaMemcpyHostToDevice, stream);
+
+            // Step B: Mimi Encode (TensorRT FP16 SEANet + Fused RVQ)
+            auto t_enc0 = std::chrono::high_resolution_clock::now();
+            trt_enc.execute(d_pcm_in, d_enc_latent, stream);
+            bmo_rvq_encode(d_enc_latent, d_w_in0, d_e0, d_norm0, d_w_in_rest, d_e_rest, d_norm_rest,
+                           d_rvq_codes, d_rvq_scratch, stream);
+            cudaStreamSynchronize(stream);
+            auto t_enc1 = std::chrono::high_resolution_clock::now();
+            ms_enc = std::chrono::duration<double, std::milli>(t_enc1 - t_enc0).count();
+
+            cudaMemcpy(user_tokens, d_rvq_codes, 8 * sizeof(int32_t), cudaMemcpyDeviceToHost);
+        } else {
+            user_is_speaking = false;
+            // Suppress headset sidetone / speaker bleed with clean silence tokens
+            std::memcpy(user_tokens, user_silence_tokens, 8 * sizeof(int32_t));
+        }
 
         // Step C: Interleave 17 Codebook Channels (Kyutai Moshi invariant)
         if (frame_count == 0) {
@@ -783,6 +799,10 @@ int main(int argc, char ** argv) {
 
         // Step G: Playback Queue & State Update
         alsa.out_queue.push(pcm_out_h);
+
+        float cur_agent_rms = 0.0f;
+        for (float s : pcm_out_h) cur_agent_rms += s * s;
+        last_agent_rms = std::sqrt(cur_agent_rms / 1920.0f);
 
         if (out_recording.size() < 24000 * 300) { // Limit recording buffer to 5 mins
             out_recording.insert(out_recording.end(), pcm_out_h.begin(), pcm_out_h.end());
