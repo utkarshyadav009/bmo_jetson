@@ -1,0 +1,24 @@
+# Weights & large model files
+*.gguf
+*.bin
+
+# Build artifacts
+build/
+bin/
+lib/
+*.o
+*.a
+*.so
+*.dylib
+
+# Local symlinks & dependencies
+llama.cpp
+
+# Logs & temp files
+*.log
+*.tmp
+.cache/
+
+# System files
+.DS_Store
+Thumbs.db
