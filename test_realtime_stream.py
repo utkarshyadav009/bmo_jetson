@@ -109,19 +109,27 @@ def main():
     parser.add_argument("--top-k-audio", type=int, default=250, help="Top-K for audio sampling (default: 250)")
     args = parser.parse_args()
 
-    # Audio device selection
+    # Audio device selection & auto-routing
+    endpoint_desc = ""
     if args.audio_device is not None:
         audio_device = args.audio_device
-    elif args.device in ("cuda", "cuda:0", "cpu"):
-        audio_device = "default"
+        endpoint_desc = str(audio_device)
     else:
-        audio_device = args.device
+        try:
+            sys.path.insert(0, "/home/bmo")
+            from bmo_audio_routing import detect_and_configure_audio
+            cfg = detect_and_configure_audio(mode="auto")
+            audio_device = cfg["in_dev"]
+            endpoint_desc = f"{cfg['desc']} (Pulse Device {audio_device})"
+        except Exception:
+            audio_device = "default"
+            endpoint_desc = "default"
 
     print("=" * 70)
     print("  BMO Stage 4: Real-Time Full-Duplex Audio Streaming Benchmark")
     print("=" * 70)
     print(f"[*] Target Duration:  {args.duration:.1f} s (~{int(args.duration / 0.080)} frames)")
-    print(f"[*] Audio Device:     {audio_device}")
+    print(f"[*] Audio Endpoint:   {endpoint_desc}")
     print(f"[*] Compute Device:   {args.device}")
     print(f"[*] Sampling Mode:    {'Top-K Sampling' if args.sample else 'Greedy Argmax'}")
     print(f"[*] Input Mode:       {'Physical Microphone' if args.use_mic else 'Audio Stream (' + args.input_wav + ')'}")
