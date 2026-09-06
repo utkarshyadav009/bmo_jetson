@@ -302,6 +302,11 @@ void bmo_load_model(const char * fname, bmo_model & model, bmo_context & ctx) {
     if (ctx.rope_theta <= 0.0f) ctx.rope_theta = read_scalar_f32(data_ctx, "rope_freq_base", 0.0f);
     if (ctx.rope_theta <= 0.0f) ctx.rope_theta = 10000.0f;
 
+    // RMSNorm epsilon: standard Moshi rms_norm_f32 uses 1e-8f
+    ctx.norm_eps = read_scalar_f32(data_ctx, "norm_eps", 0.0f);
+    if (ctx.norm_eps <= 0.0f) ctx.norm_eps = read_scalar_f32(data_ctx, "rms_norm_eps", 0.0f);
+    if (ctx.norm_eps <= 0.0f) ctx.norm_eps = 1e-8f;
+
     // Infer missing temporal dimensions from packed QKV metadata in layer 0.
     {
         const std::string qkv0 = "transformer_layers_0_self_attn_in_proj_weight";
@@ -586,6 +591,7 @@ void bmo_load_model(const char * fname, bmo_model & model, bmo_context & ctx) {
               << " n_embd=" << ctx.n_embd
               << " n_ctx=" << ctx.n_ctx
               << " rope_theta=" << ctx.rope_theta
+              << " norm_eps=" << ctx.norm_eps
               << " num_codebooks=" << ctx.num_codebooks
               << " dep_q=" << ctx.dep_q
               << " text_vocab=" << ctx.text_vocab_size

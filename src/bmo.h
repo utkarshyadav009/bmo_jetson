@@ -234,6 +234,9 @@ struct bmo_context {
     // RoPE base frequency (theta). Parsed from the GGUF metadata at load time.
     float rope_theta = 10000.0f;
 
+    // RMSNorm epsilon. Parsed from the GGUF metadata at load time (default 1e-8f for Moshi).
+    float norm_eps = 1e-8f;
+
     // Physical KV cache tensors allocated in kv_ctx
     ggml_tensor * k_cache = nullptr;
     ggml_tensor * v_cache = nullptr;

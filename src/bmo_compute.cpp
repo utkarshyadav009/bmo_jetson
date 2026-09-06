@@ -398,7 +398,7 @@ static ggml_tensor * apply_rmsnorm_gpu(
     ggml_context * wctx,
     ggml_tensor * x,
     ggml_tensor * weight,
-    float eps) {
+    float eps = 1e-8f) {
     if (!x || !weight) {
         throw std::runtime_error("apply_rmsnorm_gpu: null input/weight tensor");
     }
@@ -2212,12 +2212,12 @@ ggml_cgraph * bmo_build_temporal_graph(
 #ifdef BMO_JETSON
         ggml_tensor * x_norm;
         if (model.temporal_layers[layer].norm1_weight) {
-            x_norm = apply_rmsnorm_gpu(ctx, wctx, x, model.temporal_layers[layer].norm1_weight, 1e-5f);
+            x_norm = apply_rmsnorm_gpu(ctx, wctx, x, model.temporal_layers[layer].norm1_weight, ctx.norm_eps);
         } else {
-            x_norm = ggml_rms_norm(wctx, x, 1e-5f);
+            x_norm = ggml_rms_norm(wctx, x, ctx.norm_eps);
         }
 #else
-        ggml_tensor * x_norm = ggml_rms_norm(wctx, x, 1e-5f);
+        ggml_tensor * x_norm = ggml_rms_norm(wctx, x, ctx.norm_eps);
         if (model.temporal_layers[layer].norm1_weight) {
             x_norm = ggml_mul(wctx, x_norm, model.temporal_layers[layer].norm1_weight);
         }
@@ -2463,12 +2463,12 @@ ggml_cgraph * bmo_build_temporal_graph(
 #ifdef BMO_JETSON
         ggml_tensor * ff_norm;
         if (model.temporal_layers[layer].norm2_weight) {
-            ff_norm = apply_rmsnorm_gpu(ctx, wctx, x, model.temporal_layers[layer].norm2_weight, 1e-5f);
+            ff_norm = apply_rmsnorm_gpu(ctx, wctx, x, model.temporal_layers[layer].norm2_weight, ctx.norm_eps);
         } else {
-            ff_norm = ggml_rms_norm(wctx, x, 1e-5f);
+            ff_norm = ggml_rms_norm(wctx, x, ctx.norm_eps);
         }
 #else
-        ggml_tensor * ff_norm = ggml_rms_norm(wctx, x, 1e-5f);
+        ggml_tensor * ff_norm = ggml_rms_norm(wctx, x, ctx.norm_eps);
         if (model.temporal_layers[layer].norm2_weight) {
             ff_norm = ggml_mul(wctx, ff_norm, model.temporal_layers[layer].norm2_weight);
         }
@@ -2661,9 +2661,9 @@ ggml_cgraph * bmo_build_temporal_graph(
         ggml_tensor * final_x = x;
         if (end == ctx.n_layers && model.out_norm_weight) {
 #ifdef BMO_JETSON
-            final_x = apply_rmsnorm_gpu(ctx, wctx, x, model.out_norm_weight, 1e-5f);
+            final_x = apply_rmsnorm_gpu(ctx, wctx, x, model.out_norm_weight, ctx.norm_eps);
 #else
-            ggml_tensor * normed = ggml_rms_norm(wctx, x, 1e-5f);
+            ggml_tensor * normed = ggml_rms_norm(wctx, x, ctx.norm_eps);
             final_x = ggml_mul(wctx, normed, model.out_norm_weight);
 #endif
             bmo_h3_tap_head("T7", "post_out_norm", final_x);
@@ -2937,9 +2937,9 @@ ggml_cgraph * bmo_build_depth_graph(
             throw std::runtime_error("bmo_build_depth_graph: missing norm1_weight for depth layer " + std::to_string(i));
         }
 #ifdef BMO_JETSON
-        if (n_token == 1) {
+        if (n_token == 1 && w_slice->type == GGML_TYPE_Q4_0 && w_out_slice->type == GGML_TYPE_Q4_0) {
             ggml_tensor * residual = x;
-            ggml_tensor * x_norm = apply_rmsnorm_gpu(ctx, wctx, x, model.depth_layers[(size_t) i].norm1_weight, 1e-5f);
+            ggml_tensor * x_norm = apply_rmsnorm_gpu(ctx, wctx, x, model.depth_layers[(size_t) i].norm1_weight, ctx.norm_eps);
             ggml_tensor * qkv = apply_dense_q4_0_linear_gpu(ctx, wctx, w_slice, x_norm);
 
             const int64_t q_dim = hidden_dim;
@@ -3005,7 +3005,7 @@ ggml_cgraph * bmo_build_depth_graph(
 
             // FFN
             ggml_tensor * ff_residual = x;
-            ggml_tensor * ff_norm = apply_rmsnorm_gpu(ctx, wctx, x, model.depth_layers[(size_t) i].norm2_weight, 1e-5f);
+            ggml_tensor * ff_norm = apply_rmsnorm_gpu(ctx, wctx, x, model.depth_layers[(size_t) i].norm2_weight, ctx.norm_eps);
 
             ggml_tensor * depth_gating_in_w = ((size_t) i < 6 && (size_t) codebook_step < (size_t) DEP_Q)
                 ? model.depth_gating_in[i][codebook_step] : nullptr;
@@ -3071,7 +3071,7 @@ ggml_cgraph * bmo_build_depth_graph(
         // graph_compute order this with the upstream adds is correct and the
         // depth tier is small enough that the GPU detour wouldn't help much
         // anyway.
-        ggml_tensor * x_norm = ggml_rms_norm(wctx, x, 1e-5f);
+        ggml_tensor * x_norm = ggml_rms_norm(wctx, x, ctx.norm_eps);
         x_norm = ggml_mul(wctx, x_norm, model.depth_layers[(size_t) i].norm1_weight);
         if (debug_step0 && i == 0) {
             ggml_set_name(x_norm, "depth_x_norm");
@@ -3238,7 +3238,7 @@ ggml_cgraph * bmo_build_depth_graph(
         // route it through apply_rmsnorm_gpu without reading uninitialised
         // data at graph-build time.
         ggml_tensor * ff_residual = x;
-        ggml_tensor * ff_norm = ggml_rms_norm(wctx, x, 1e-5f);
+        ggml_tensor * ff_norm = ggml_rms_norm(wctx, x, ctx.norm_eps);
         if (model.depth_layers[(size_t) i].norm2_weight) {
             ff_norm = ggml_mul(wctx, ff_norm, model.depth_layers[(size_t) i].norm2_weight);
         }
