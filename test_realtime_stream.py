@@ -346,6 +346,8 @@ def main():
     user_speech_end_time = 0.0
     agent_rms = 0.0
     user_silence_tokens = np.array([1049, 243, 783, 1562, 340, 2010, 183, 1665], dtype=np.int32)
+    user_speech_consecutive = 0
+    user_silence_consecutive = 0
     session_pcm_records = []
 
     start_rss = get_vram_mb()
@@ -370,18 +372,30 @@ def main():
 
                 t_frame_start = time.perf_counter()
 
-                # Acoustic echo suppression & Voice Activity Detection
+                # Acoustic echo suppression & debounced Voice Activity Detection
                 user_rms = float(np.sqrt(np.mean(frame_chunk ** 2)))
-                agent_active = turn_agent_speaking or (agent_rms > 0.012)
-                echo_threshold = max(0.045, 0.65 * agent_rms) if agent_active else 0.015
+                agent_active = turn_agent_speaking or (agent_rms > 0.015)
+                echo_threshold = max(0.065, 0.90 * agent_rms) if agent_active else 0.015
 
-                is_user_speech = user_rms >= echo_threshold
+                raw_user_speech = user_rms >= echo_threshold
+                if raw_user_speech:
+                    user_speech_consecutive += 1
+                    user_silence_consecutive = 0
+                else:
+                    user_silence_consecutive += 1
+                    user_speech_consecutive = 0
 
-                if is_user_speech:
-                    if not turn_user_speaking:
-                        turn_user_speaking = True
-                        if turn_agent_speaking:
-                            print("\n  [INTERRUPTION] User speech detected over BMO output!")
+                # Require 3 consecutive frames (240ms) when agent is speaking, or 2 frames (160ms) when quiet
+                required_frames = 3 if agent_active else 2
+                if not turn_user_speaking and user_speech_consecutive >= required_frames:
+                    turn_user_speaking = True
+                    if turn_agent_speaking:
+                        print("\n  [INTERRUPTION] User speech detected over BMO output!")
+                elif turn_user_speaking and user_silence_consecutive >= 3:
+                    turn_user_speaking = False
+                    user_speech_end_time = time.perf_counter()
+
+                if turn_user_speaking:
                     # Step A: Mimi Encode
                     t_chunk_gpu.copy_(torch.from_numpy(frame_chunk))
                     t_enc_0 = time.perf_counter()
@@ -389,9 +403,6 @@ def main():
                     t_enc = (time.perf_counter() - t_enc_0) * 1000.0
                     user_tokens = user_codes[0, :, 0].detach().cpu().numpy().astype(np.int32)
                 else:
-                    if turn_user_speaking:
-                        turn_user_speaking = False
-                        user_speech_end_time = time.perf_counter()
                     t_enc = 0.0
                     # Suppress speaker bleed / ambient noise with clean Mimi silence tokens
                     user_tokens = user_silence_tokens.copy()

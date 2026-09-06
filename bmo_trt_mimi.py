@@ -85,24 +85,12 @@ class TRTMimiCodec:
         self.mimi.streaming_forever(1)
         optimize_quantizer(self.mimi)
 
+        # Keep TRT SEANet engines disabled: SEANet requires streaming causal convolution
+        # state buffers that are preserved across frames by PyTorch's CUDA-graphed
+        # state.graphed_encoder (3.9ms) and state.graphed_decoder (3.5ms).
+        # Stateless TRT export resets conv states every frame, causing severe audio distortion.
         self.has_trt_enc = False
         self.has_trt_dec = False
-
-        if _HAS_TRT and os.path.isfile(encoder_engine_path):
-            try:
-                self.trt_encoder = TRTEngineRunner(encoder_engine_path, "audio", "latent")
-                self.has_trt_enc = True
-                print(f"[+] Loaded TensorRT SEANet Encoder: {encoder_engine_path}")
-            except Exception as e:
-                print(f"[!] Could not load TRT encoder ({e}), using PyTorch fallback")
-
-        if _HAS_TRT and os.path.isfile(decoder_engine_path):
-            try:
-                self.trt_decoder = TRTEngineRunner(decoder_engine_path, "latent", "audio")
-                self.has_trt_dec = True
-                print(f"[+] Loaded TensorRT SEANet Decoder: {decoder_engine_path}")
-            except Exception as e:
-                print(f"[!] Could not load TRT decoder ({e}), using PyTorch fallback")
 
         # Fused RVQ Precomputed Tables & Static Buffers
         self.has_fused_rvq = _HAS_LIBBMO_RVQ
