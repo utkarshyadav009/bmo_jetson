@@ -102,3 +102,8 @@ target_link_libraries(bmo_engine PRIVATE bmo ${_link_targets} CUDA::cudart CUDA:
 add_executable(bmo_kernel_bench src/bmo_kernel_bench.cu)
 target_include_directories(bmo_kernel_bench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(bmo_kernel_bench PRIVATE CUDA::cudart Threads::Threads)
+
+# 5. Native C++ Real-Time Audio Daemon: bmo_daemon
+add_executable(bmo_daemon src/bmo_daemon.cpp)
+target_include_directories(bmo_daemon PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" ${GGML_INCLUDE_DIRS} /usr/local/cuda/include)
+target_link_libraries(bmo_daemon PRIVATE bmo_shared ${_link_targets} CUDA::cudart CUDA::cuda_driver Threads::Threads nvinfer asound)

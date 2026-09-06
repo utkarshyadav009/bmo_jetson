@@ -54,8 +54,30 @@ def optimize_quantizer(mimi):
         cb._quantize = make_fast_quantize(cb)
 
 
+import ctypes
+
+try:
+    _libbmo_path = os.path.join(os.path.dirname(__file__), "build", "libbmo.so")
+    if os.path.isfile(_libbmo_path):
+        _libbmo = ctypes.CDLL(_libbmo_path)
+    else:
+        _libbmo = ctypes.CDLL("libbmo.so")
+    _libbmo.bmo_rvq_decode.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    _libbmo.bmo_rvq_decode.restype = ctypes.c_int
+    _libbmo.bmo_rvq_encode.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p
+    ]
+    _libbmo.bmo_rvq_encode.restype = ctypes.c_int
+    _HAS_LIBBMO_RVQ = True
+except Exception as e:
+    _libbmo = None
+    _HAS_LIBBMO_RVQ = False
+
+
 class TRTMimiCodec:
-    """High-performance hybrid TensorRT + PyTorch Mimi wrapper."""
+    """High-performance hybrid TensorRT + Fused CUDA RVQ Mimi wrapper."""
 
     def __init__(self, mimi_model, encoder_engine_path: str = "seanet_encoder.engine", decoder_engine_path: str = "seanet_decoder.engine"):
         self.mimi = mimi_model
@@ -82,6 +104,44 @@ class TRTMimiCodec:
             except Exception as e:
                 print(f"[!] Could not load TRT decoder ({e}), using PyTorch fallback")
 
+        # Fused RVQ Precomputed Tables & Static Buffers
+        self.has_fused_rvq = _HAS_LIBBMO_RVQ
+        if self.has_fused_rvq:
+            try:
+                # 1. Precomputed Decode Projection Tables: [8, 2048, 512]
+                W0 = self.mimi.quantizer.rvq_first.output_proj.weight.squeeze(-1) # [512, 256]
+                E0 = self.mimi.quantizer.rvq_first.vq.layers[0]._codebook.embedding # [2048, 256]
+                proj_E0 = (E0 @ W0.T).unsqueeze(0) # [1, 2048, 512]
+
+                W_rest = self.mimi.quantizer.rvq_rest.output_proj.weight.squeeze(-1) # [512, 256]
+                proj_E_rest = torch.stack([
+                    self.mimi.quantizer.rvq_rest.vq.layers[i]._codebook.embedding @ W_rest.T
+                    for i in range(7)
+                ]) # [7, 2048, 512]
+                self.rvq_proj_tables = torch.cat([proj_E0, proj_E_rest], dim=0).contiguous()
+
+                # 2. Encode Weights & Norms
+                self.w_in0 = self.mimi.quantizer.rvq_first.input_proj.weight.squeeze(-1).contiguous()
+                self.e0 = self.mimi.quantizer.rvq_first.vq.layers[0]._codebook.embedding.contiguous()
+                self.norm0 = (0.5 * (self.e0 ** 2).sum(dim=1)).contiguous()
+
+                self.w_in_rest = self.mimi.quantizer.rvq_rest.input_proj.weight.squeeze(-1).contiguous()
+                self.e_rest = torch.stack([
+                    self.mimi.quantizer.rvq_rest.vq.layers[i]._codebook.embedding for i in range(7)
+                ]).contiguous()
+                self.norm_rest = torch.stack([
+                    0.5 * (self.e_rest[i] ** 2).sum(dim=1) for i in range(7)
+                ]).contiguous()
+
+                # Scratch & I/O buffers
+                self.rvq_scratch = torch.zeros(512, dtype=torch.float32, device="cuda")
+                self.rvq_codes_out = torch.zeros(8, dtype=torch.int32, device="cuda")
+                self.rvq_dec_out = torch.zeros((1, 512, 1), dtype=torch.float32, device="cuda")
+                print("[+] Loaded Fused CUDA Mimi RVQ Quantizer (sub-millisecond latency)")
+            except Exception as e:
+                print(f"[!] Could not setup fused RVQ ({e}), using fast GEMM fallback")
+                self.has_fused_rvq = False
+
         # Static preallocated GPU buffers
         self.enc_out_buf = torch.empty((1, 512, 2), dtype=torch.float32, device="cuda")
         self.dec_out_buf = torch.empty((1, 1, 1920), dtype=torch.float32, device="cuda")
@@ -98,13 +158,40 @@ class TRTMimiCodec:
         if self.mimi.encoder_transformer is not None:
             (emb,) = state.graphed_tr_enc(emb)
         emb = self.mimi._to_framerate(emb)
-        codes = self.mimi.quantizer.encode(emb)
-        return codes
+
+        if self.has_fused_rvq:
+            _libbmo.bmo_rvq_encode(
+                emb.data_ptr(),
+                self.w_in0.data_ptr(),
+                self.e0.data_ptr(),
+                self.norm0.data_ptr(),
+                self.w_in_rest.data_ptr(),
+                self.e_rest.data_ptr(),
+                self.norm_rest.data_ptr(),
+                self.rvq_codes_out.data_ptr(),
+                self.rvq_scratch.data_ptr(),
+                None
+            )
+            return self.rvq_codes_out.view(1, 8, 1)
+        else:
+            codes = self.mimi.quantizer.encode(emb)
+            return codes
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         """Decode (1, 8, 1) codebooks -> PCM audio (1, 1, 1920)."""
         state = self.mimi._streaming_state
-        emb = self.mimi.decode_latent(codes)
+        if self.has_fused_rvq:
+            codes_i32 = codes.view(8).to(torch.int32).contiguous()
+            _libbmo.bmo_rvq_decode(
+                codes_i32.data_ptr(),
+                self.rvq_proj_tables.data_ptr(),
+                self.rvq_dec_out.data_ptr(),
+                None
+            )
+            emb = self.rvq_dec_out
+        else:
+            emb = self.mimi.decode_latent(codes)
+
         emb = self.mimi._to_encoder_framerate(emb)
         if self.mimi.decoder_transformer is not None:
             (emb,) = state.graphed_tr_dec(emb)

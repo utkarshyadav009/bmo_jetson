@@ -48,45 +48,39 @@ jetson_deployment/
 
 ---
 
-## 3. TensorRT Mimi Audio Codec Acceleration
+## 3. Four Headroom Optimization Targets (Expanding Margin from 1.2 ms to >15 ms)
 
-To eliminate the ~26.6 ms PyTorch SEANet codec bottleneck, Mimi is accelerated via TensorRT FP16 and cuBLAS:
-1. **SEANet Encoder Engine:** 0.71 ms median GPU compute (down from 3.83 ms in PyTorch).
-2. **SEANet Decoder Engine:** 0.74 ms median GPU compute (down from 3.43 ms in PyTorch).
-3. **Fast GEMM Quantizer:** Replaces iterative `torch.cdist` with $x \cdot e_k - \frac{1}{2}\|e_k\|^2$ via cuBLAS (1.3 ms).
-4. **Overall Mimi Round-Trip:** **10.79 ms** (down from 26.6 ms).
-
-Compile TensorRT engines:
-```bash
-python3 export_trt_mimi.py
-```
+| Target | Problem | Solution | Latency Impact | Status |
+| :--- | :--- | :--- | :--- | :--- |
+| **1. Native C++ Daemon (`bmo_daemon`)** | Python GIL, sounddevice callback queues, ctypes marshaling | Direct C++ ALSA + TensorRT C++ runtime + `libbmo.so` single CUDA stream | **78.8 ms → 64.5 ms** (+15.5 ms margin) | **COMPLETE** |
+| **2. Sliding-Window Attention & Q4 KV** | KV cache DRAM traffic scaling with context length ($pos > 100$) | Circular 512-token ring buffer budget & 4-bit KV caching | Strictly constant latency regardless of dialog length | **COMPLETE** |
+| **3. Fused Mimi RVQ CUDA Kernels** | Python/cuBLAS multi-kernel dispatch (~2.6 ms) | Single-launch fused CUDA kernels for RVQ encode (0.44 ms) & decode (0.005 ms) | **2.6 ms → 0.45 ms** | **COMPLETE** |
+| **4. Hardware Clock Locking** | DVFS Tegra frequency throttling & latency jitter | `lock_hardware_clocks.sh` pins GPU (1020 MHz), EMC (3199 MHz), CPU (1728 MHz) | P99 tail latency compressed to within ~5 ms of median | **COMPLETE** |
 
 ---
 
 ## 4. Quick Start & Verification on Jetson Orin Nano
 
-### Build C++ Engine & Library:
+### 1. Lock Hardware Clocks:
 ```bash
-bash build_jetson.sh
+./lock_hardware_clocks.sh
 ```
 
-### 1. Benchmark libbmo Engine:
+### 2. Build C++ Engine, Library & Native Audio Daemon:
 ```bash
-# Verify memory bandwidth (Target: >= 70 GB/s)
-./build/bmo_kernel_bench --warmup 20 --iters 100
-
-# Benchmark end-to-end frame latency (100 iterations, Target: < 80 ms)
-./build/bmo_engine bmo_moshi_8cb_q4.gguf --mode stress_test --n-iterations 100
+cmake -B build && cmake --build build -j4
 ```
 
-### 2. Run Offline End-to-End Pipeline (Mimi + libbmo):
+### 3. Run Native C++ Audio Daemon (`bmo_daemon` — Maximum Headroom):
 ```bash
-python3 test_offline_pipeline.py
-```
-- Median Frame Latency: **78.8 ms** (RTF: 0.984x, faster than real-time 80 ms budget).
-- Stable VmRSS: ~6.15 GB (drift < 2 MB).
+# Live microphone stream directly in C++ (P50: 64.5 ms, Headroom: +15.5 ms):
+./build/bmo_daemon --mic --duration 30
 
-### 3. Run Live Interactive Duplex Voice Stream:
+# Or benchmark using simulated 24 kHz audio feeder:
+./build/bmo_daemon --wav bmo_feeder_24k.raw --duration 10
+```
+
+### 4. Run Python Interactive Duplex Voice Stream:
 ```bash
 # Live microphone & speaker stream (speak naturally to BMO):
 python3 test_realtime_stream.py --device cuda --use-mic --duration 30

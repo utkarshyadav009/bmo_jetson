@@ -736,21 +736,25 @@ __global__ void bmo_decode_attention_kernel(
     const int q_per_kv = (n_kv_heads > 0) ? (n_heads / n_kv_heads) : 1;
     const int kv_h = (n_kv_heads == n_heads) ? h : (h / q_per_kv);
 
+    // Sliding window attention geometry: circular ring-buffer over n_ctx positions
+    const int total_tokens = effective_past + 1;
+    const int window_len   = (total_tokens > n_ctx) ? n_ctx : total_tokens;
+    const int start_token  = total_tokens - window_len;
+    const int cur_slot     = effective_past % n_ctx;
+
     const size_t per_layer = (size_t) head_dim * (size_t) n_ctx * (size_t) n_heads;
     const size_t per_head  = (size_t) head_dim * (size_t) n_ctx;
-    const size_t cache_offset = (size_t) layer * per_layer + (size_t) h * per_head + (size_t) effective_past * (size_t) head_dim;
+    const size_t cache_offset = (size_t) layer * per_layer + (size_t) h * per_head + (size_t) cur_slot * (size_t) head_dim;
 
-    // Step 1: Write current K and V to cache
+    // Step 1: Write current K and V to circular cache slot
     if (h < n_kv_heads) {
         k_cache[cache_offset + tid] = __float2half(k[h * head_dim + tid]);
         v_cache[cache_offset + tid] = __float2half(v[h * head_dim + tid]);
     }
     __syncthreads();
 
-    const int kv_len = effective_past + 1;
-
-    // Fast path: kv_len == 1
-    if (kv_len == 1) {
+    // Fast path: window_len == 1
+    if (window_len == 1) {
         out[h * head_dim + tid] = v[kv_h * head_dim + tid];
         return;
     }
@@ -765,8 +769,10 @@ __global__ void bmo_decode_attention_kernel(
     const int warp_id = tid >> 5;
     const int num_warps = (head_dim + 31) >> 5;
 
-    for (int t = 0; t < kv_len; ++t) {
-        const float k_val = __half2float(k_cache[kv_head_base + (size_t) t * (size_t) head_dim + tid]);
+    for (int i = 0; i < window_len; ++i) {
+        int t = start_token + i;
+        int slot_t = t % n_ctx;
+        const float k_val = __half2float(k_cache[kv_head_base + (size_t) slot_t * (size_t) head_dim + tid]);
         float dot = q_val * k_val;
         dot = bmo_warp_reduce_sum(dot);
         if (lane_id == 0) {
@@ -779,15 +785,15 @@ __global__ void bmo_decode_attention_kernel(
             for (int w = 0; w < num_warps; ++w) {
                 total_dot += s_warp[w];
             }
-            s_scores[t] = total_dot * scale;
+            s_scores[i] = total_dot * scale;
         }
         __syncthreads();
     }
 
-    // Parallel softmax reduction across all 128 threads in block
+    // Parallel softmax reduction across all 128 threads in block for window_len
     float local_max = -1e20f;
-    for (int t = tid; t < kv_len; t += blockDim.x) {
-        if (s_scores[t] > local_max) local_max = s_scores[t];
+    for (int i = tid; i < window_len; i += blockDim.x) {
+        if (s_scores[i] > local_max) local_max = s_scores[i];
     }
     local_max = bmo_warp_reduce_max(local_max);
     if (lane_id == 0) {
@@ -805,9 +811,9 @@ __global__ void bmo_decode_attention_kernel(
     const float max_s = s_warp[0];
 
     float local_sum = 0.0f;
-    for (int t = tid; t < kv_len; t += blockDim.x) {
-        float e = expf(s_scores[t] - max_s);
-        s_scores[t] = e;
+    for (int i = tid; i < window_len; i += blockDim.x) {
+        float e = expf(s_scores[i] - max_s);
+        s_scores[i] = e;
         local_sum += e;
     }
     local_sum = bmo_warp_reduce_sum(local_sum);
@@ -825,15 +831,17 @@ __global__ void bmo_decode_attention_kernel(
     __syncthreads();
     const float inv_sum = s_warp[0];
 
-    for (int t = tid; t < kv_len; t += blockDim.x) {
-        s_scores[t] *= inv_sum;
+    for (int i = tid; i < window_len; i += blockDim.x) {
+        s_scores[i] *= inv_sum;
     }
     __syncthreads();
 
     float acc = 0.0f;
-    for (int t = 0; t < kv_len; ++t) {
-        const float w = s_scores[t];
-        const float v_val = __half2float(v_cache[kv_head_base + (size_t) t * (size_t) head_dim + tid]);
+    for (int i = 0; i < window_len; ++i) {
+        const float w = s_scores[i];
+        int t = start_token + i;
+        int slot_t = t % n_ctx;
+        const float v_val = __half2float(v_cache[kv_head_base + (size_t) slot_t * (size_t) head_dim + tid]);
         acc += w * v_val;
     }
     out[h * head_dim + tid] = acc;
@@ -873,4 +881,183 @@ void launch_decode_attention(
         layer,
         scale,
         pos_dev);
+}
+
+// ---------------------------------------------------------------------------
+// Fused Mimi RVQ Vector Quantization & Dequantization Kernels
+// ---------------------------------------------------------------------------
+
+__global__ void bmo_rvq_decode_kernel(
+    const int32_t * __restrict__ codes,        // [8]
+    const float * __restrict__ proj_tables,    // [8, 2048, 512]
+    float * __restrict__ out                   // [512]
+) {
+    int tid = threadIdx.x + blockIdx.x * blockDim.x; // 0..511
+    if (tid >= 512) return;
+
+    float sum = 0.0f;
+    #pragma unroll
+    for (int cb = 0; cb < 8; ++cb) {
+        int code = codes[cb];
+        if (code >= 0 && code < 2048) {
+            size_t offset = (size_t) cb * (2048 * 512) + (size_t) code * 512 + tid;
+            sum += proj_tables[offset];
+        }
+    }
+    out[tid] = sum;
+}
+
+void launch_rvq_decode(
+    const int32_t * codes_dev,
+    const float * proj_tables_dev,
+    float * out_dev,
+    void * stream) {
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    bmo_rvq_decode_kernel<<<2, 256, 0, s>>>(codes_dev, proj_tables_dev, out_dev);
+}
+
+__global__ void bmo_rvq_step_kernel(
+    const float * __restrict__ r,          // [256]
+    const float * __restrict__ embeddings, // [2048, 256]
+    const float * __restrict__ norms,      // [2048]
+    float * __restrict__ block_best_val,   // [64]
+    int32_t * __restrict__ block_best_idx  // [64]
+) {
+    int tid = threadIdx.x; // 0..255
+    int lane = tid & 31;
+    int warp = tid >> 5;
+
+    __shared__ float s_warp[8];
+    __shared__ float s_r[256];
+    s_r[tid] = r[tid];
+    __syncthreads();
+
+    float best_score = -1e20f;
+    int best_k = -1;
+
+    int base_k = blockIdx.x * 32;
+    for (int c = 0; c < 32; ++c) {
+        int k = base_k + c;
+        float prod = s_r[tid] * embeddings[(size_t) k * 256 + tid];
+        prod = bmo_warp_reduce_sum(prod);
+        if (lane == 0) s_warp[warp] = prod;
+        __syncthreads();
+
+        if (tid == 0) {
+            float dot = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) dot += s_warp[w];
+            float score = dot - norms[k];
+            if (score > best_score) {
+                best_score = score;
+                best_k = k;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        block_best_val[blockIdx.x] = best_score;
+        block_best_idx[blockIdx.x] = best_k;
+    }
+}
+
+__global__ void bmo_rvq_reduce_and_update_kernel(
+    const float * __restrict__ block_best_val,
+    const int32_t * __restrict__ block_best_idx,
+    const float * __restrict__ embeddings, // [2048, 256]
+    float * __restrict__ r,                // [256]
+    int32_t * __restrict__ out_codes,      // [8]
+    int stage
+) {
+    int tid = threadIdx.x;
+    float val = block_best_val[tid];
+    int idx = block_best_idx[tid];
+
+    __shared__ float s_val[64];
+    __shared__ int s_idx[64];
+    s_val[tid] = val;
+    s_idx[tid] = idx;
+    __syncthreads();
+
+    #pragma unroll
+    for (int s = 32; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (s_val[tid + s] > s_val[tid]) {
+                s_val[tid] = s_val[tid + s];
+                s_idx[tid] = s_idx[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+
+    __shared__ int win_idx;
+    if (tid == 0) {
+        win_idx = s_idx[0];
+        out_codes[stage] = win_idx;
+    }
+    __syncthreads();
+
+    int best = win_idx;
+    for (int d = tid; d < 256; d += 64) {
+        r[d] -= embeddings[(size_t) best * 256 + d];
+    }
+}
+
+__global__ void bmo_rvq_in_proj_kernel(
+    const float * __restrict__ x_512,
+    const float * __restrict__ W_proj, // [256, 512]
+    float * __restrict__ r_256
+) {
+    int row = blockIdx.x; // 0..255
+    int tid = threadIdx.x; // 0..255
+
+    __shared__ float s_warp[8];
+    float dot = x_512[tid] * W_proj[(size_t) row * 512 + tid] +
+                x_512[tid + 256] * W_proj[(size_t) row * 512 + tid + 256];
+
+    dot = bmo_warp_reduce_sum(dot);
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) s_warp[warp] = dot;
+    __syncthreads();
+
+    if (tid == 0) {
+        float total = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) total += s_warp[w];
+        r_256[row] = total;
+    }
+}
+
+void launch_rvq_encode(
+    const float * in_vec_dev,       // [512]
+    const float * w_in0_dev,        // [256, 512]
+    const float * e0_dev,           // [2048, 256]
+    const float * norm0_dev,        // [2048]
+    const float * w_in_rest_dev,    // [256, 512]
+    const float * e_rest_dev,       // [7, 2048, 256]
+    const float * norm_rest_dev,    // [7, 2048]
+    int32_t * out_codes_dev,        // [8]
+    float * scratch_dev,            // at least (256 + 64 + 64) * sizeof(float)
+    void * stream) {
+
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    float * d_r = scratch_dev;               // [256]
+    float * d_bval = d_r + 256;              // [64]
+    int32_t * d_bidx = reinterpret_cast<int32_t *>(d_bval + 64); // [64]
+
+    // Stage 0: semantic
+    bmo_rvq_in_proj_kernel<<<256, 256, 0, s>>>(in_vec_dev, w_in0_dev, d_r);
+    bmo_rvq_step_kernel<<<64, 256, 0, s>>>(d_r, e0_dev, norm0_dev, d_bval, d_bidx);
+    bmo_rvq_reduce_and_update_kernel<<<1, 64, 0, s>>>(d_bval, d_bidx, e0_dev, d_r, out_codes_dev, 0);
+
+    // Stage 1..7: acoustic
+    bmo_rvq_in_proj_kernel<<<256, 256, 0, s>>>(in_vec_dev, w_in_rest_dev, d_r);
+    for (int stage = 1; stage < 8; ++stage) {
+        size_t emb_offset = (size_t) (stage - 1) * (2048 * 256);
+        size_t norm_offset = (size_t) (stage - 1) * 2048;
+        bmo_rvq_step_kernel<<<64, 256, 0, s>>>(d_r, e_rest_dev + emb_offset, norm_rest_dev + norm_offset, d_bval, d_bidx);
+        bmo_rvq_reduce_and_update_kernel<<<1, 64, 0, s>>>(d_bval, d_bidx, e_rest_dev + emb_offset, d_r, out_codes_dev, stage);
+    }
 }

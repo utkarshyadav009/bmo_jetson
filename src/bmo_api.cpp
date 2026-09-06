@@ -717,4 +717,45 @@ int bmo_forward_depth(
     }
 }
 
+BMO_API int bmo_rvq_decode(
+    const int32_t * codes_dev,
+    const float * proj_tables_dev,
+    float * out_dev,
+    void * stream) {
+    if (!codes_dev || !proj_tables_dev || !out_dev) return 1;
+#ifdef BMO_ENABLE_CUDA
+    launch_rvq_decode(codes_dev, proj_tables_dev, out_dev, stream);
+    return 0;
+#else
+    return 2;
+#endif
+}
+
+BMO_API int bmo_rvq_encode(
+    const float * in_vec_dev,
+    const float * w_in0_dev,
+    const float * e0_dev,
+    const float * norm0_dev,
+    const float * w_in_rest_dev,
+    const float * e_rest_dev,
+    const float * norm_rest_dev,
+    int32_t * out_codes_dev,
+    float * scratch_dev,
+    void * stream) {
+    if (!in_vec_dev || !w_in0_dev || !e0_dev || !norm0_dev ||
+        !w_in_rest_dev || !e_rest_dev || !norm_rest_dev ||
+        !out_codes_dev || !scratch_dev) {
+        return 1;
+    }
+#ifdef BMO_ENABLE_CUDA
+    launch_rvq_encode(
+        in_vec_dev, w_in0_dev, e0_dev, norm0_dev,
+        w_in_rest_dev, e_rest_dev, norm_rest_dev,
+        out_codes_dev, scratch_dev, stream);
+    return 0;
+#else
+    return 2;
+#endif
+}
+
 } // extern "C"

@@ -134,6 +134,26 @@ BMO_API int bmo_forward_depth(
 // handle and is valid until the next API call on the same handle.
 BMO_API const char * bmo_last_error(bmo_handle_t * h);
 
+// Fused Mimi RVQ decode: sums 8 vectors of dimension 512 from projected tables
+BMO_API int bmo_rvq_decode(
+    const int32_t * codes_dev,
+    const float * proj_tables_dev,
+    float * out_dev,
+    void * stream);
+
+// Fused Mimi RVQ encode: projects [512] and searches 8 codebook nearest neighbors
+BMO_API int bmo_rvq_encode(
+    const float * in_vec_dev,
+    const float * w_in0_dev,
+    const float * e0_dev,
+    const float * norm0_dev,
+    const float * w_in_rest_dev,
+    const float * e_rest_dev,
+    const float * norm_rest_dev,
+    int32_t * out_codes_dev,
+    float * scratch_dev,
+    void * stream);
+
 #ifdef __cplusplus
 }
 #endif

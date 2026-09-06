@@ -421,4 +421,22 @@ void launch_decode_attention(
     int layer,
     void * stream = nullptr,
     const int * pos_dev = nullptr);
+
+void launch_rvq_decode(
+    const int32_t * codes_dev,
+    const float * proj_tables_dev,
+    float * out_dev,
+    void * stream = nullptr);
+
+void launch_rvq_encode(
+    const float * in_vec_dev,
+    const float * w_in0_dev,
+    const float * e0_dev,
+    const float * norm0_dev,
+    const float * w_in_rest_dev,
+    const float * e_rest_dev,
+    const float * norm_rest_dev,
+    int32_t * out_codes_dev,
+    float * scratch_dev,
+    void * stream = nullptr);
 #endif

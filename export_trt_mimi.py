@@ -82,13 +82,53 @@ def compile_trt(trtexec_bin: str, onnx_path: str, engine_path: str):
     print(f"    Successfully generated {engine_path} ({os.path.getsize(engine_path) / 1024 / 1024:.1f} MB)")
 
 
+def export_rvq_weights(mimi_path: str, out_bin: str = "bmo_rvq_weights.bin"):
+    print(f"\n[+] Precomputing and exporting Mimi RVQ weights to {out_bin}...")
+    mimi = get_mimi(mimi_path, device="cpu")
+    mimi.eval()
+
+    with torch.no_grad():
+        W0 = mimi.quantizer.rvq_first.output_proj.weight.squeeze(-1)
+        E0 = mimi.quantizer.rvq_first.vq.layers[0]._codebook.embedding
+        proj_E0 = (E0 @ W0.T).unsqueeze(0)
+
+        W_rest = mimi.quantizer.rvq_rest.output_proj.weight.squeeze(-1)
+        proj_E_rest = torch.stack([
+            mimi.quantizer.rvq_rest.vq.layers[i]._codebook.embedding @ W_rest.T
+            for i in range(7)
+        ])
+        rvq_proj_tables = torch.cat([proj_E0, proj_E_rest], dim=0).contiguous().cpu().numpy().astype("float32")
+
+        w_in0 = mimi.quantizer.rvq_first.input_proj.weight.squeeze(-1).contiguous().cpu().numpy().astype("float32")
+        e0 = mimi.quantizer.rvq_first.vq.layers[0]._codebook.embedding.contiguous().cpu().numpy().astype("float32")
+        norm0 = (0.5 * (e0 ** 2).sum(axis=1)).astype("float32")
+
+        w_in_rest = mimi.quantizer.rvq_rest.input_proj.weight.squeeze(-1).contiguous().cpu().numpy().astype("float32")
+        e_rest = torch.stack([
+            mimi.quantizer.rvq_rest.vq.layers[i]._codebook.embedding for i in range(7)
+        ]).contiguous().cpu().numpy().astype("float32")
+        norm_rest = (0.5 * (e_rest ** 2).sum(axis=-1)).astype("float32")
+
+    with open(out_bin, "wb") as f:
+        f.write(rvq_proj_tables.tobytes())
+        f.write(w_in0.tobytes())
+        f.write(e0.tobytes())
+        f.write(norm0.tobytes())
+        f.write(w_in_rest.tobytes())
+        f.write(e_rest.tobytes())
+        f.write(norm_rest.tobytes())
+
+    print(f"    Exported {out_bin} ({os.path.getsize(out_bin) / (1024*1024):.1f} MB)")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Export and compile Mimi TensorRT engines on Jetson")
+    parser = argparse.ArgumentParser(description="Export and compile Mimi TensorRT engines and RVQ tables on Jetson")
     parser.add_argument("--mimi-path", default="/home/bmo/.cache/huggingface/hub/models--kyutai--moshiko-pytorch-bf16/snapshots/2bfc9ae6e89079a5cc7ed2a68436010d91a3d289/tokenizer-e351c8d8-checkpoint125.safetensors")
     parser.add_argument("--enc-onnx", default="seanet_encoder.onnx")
     parser.add_argument("--dec-onnx", default="seanet_decoder.onnx")
     parser.add_argument("--enc-engine", default="seanet_encoder.engine")
     parser.add_argument("--dec-engine", default="seanet_decoder.engine")
+    parser.add_argument("--rvq-bin", default="bmo_rvq_weights.bin")
     parser.add_argument("--skip-onnx", action="store_true", help="Skip ONNX export if files already exist")
     args = parser.parse_args()
 
@@ -100,8 +140,9 @@ def main():
 
     compile_trt(trtexec_bin, args.enc_onnx, args.enc_engine)
     compile_trt(trtexec_bin, args.dec_onnx, args.dec_engine)
+    export_rvq_weights(args.mimi_path, args.rvq_bin)
 
-    print("\n[+] All TensorRT Mimi engines compiled and ready for deployment!")
+    print("\n[+] All TensorRT Mimi engines & RVQ tables compiled and ready for deployment!")
 
 
 if __name__ == "__main__":

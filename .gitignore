@@ -18,6 +18,7 @@ llama.cpp
 *.log
 *.tmp
 *.wav
+*.raw
 .cache/
 
 # System files
