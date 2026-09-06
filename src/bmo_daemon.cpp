@@ -189,8 +189,7 @@ static std::vector<std::string> load_vocab(const std::string & path) {
 }
 
 static void print_token(const std::string & token) {
-    if (token.empty() || token == "<unk>" || token == "<pad>" || token == "<s>" || token == "</s>"
-        || token == "..." || token == "…" || token == "." || token == " ...") {
+    if (token.empty() || token == "<unk>" || token == "<pad>" || token == "<s>" || token == "</s>") {
         return;
     }
     std::string piece = token;
@@ -736,8 +735,7 @@ int main(int argc, char ** argv) {
         h_text_logits[32000] = -1e9f;
         int top_1_text = (int)(std::max_element(h_text_logits, h_text_logits + 32000) - h_text_logits);
         int next_text_token = top_1_text;
-        bool is_pause = (top_1_text == 3 || top_1_text == 0 || top_1_text == 555 ||
-                         top_1_text == 263 || top_1_text == 1095 || top_1_text == 1101);
+        bool is_pause = (top_1_text == 3 || top_1_text == 0);
         if (!is_pause && use_sampling) {
             next_text_token = sample_token_cpp(h_text_logits, 32000, temp_text, top_k_text, scratch_text, rng);
         }

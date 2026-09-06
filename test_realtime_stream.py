@@ -412,7 +412,7 @@ def main():
 
                 text_logits[32000:] = -1e9
                 top_1_text = int(np.argmax(text_logits[:32000]))
-                is_pause = top_1_text in (0, 3, 555, 263, 1095, 1101)
+                is_pause = top_1_text in (0, 3)
                 if not is_pause and args.sample:
                     next_text_token = sample_token(text_logits, temp=args.temp_text, top_k=args.top_k_text, use_sampling=True)
                 else:
