@@ -32,6 +32,7 @@ torch.set_num_threads(2)
 import sphn
 from moshi.models import get_mimi
 from bmo_engine import BMOEngine
+from bmo_trt_mimi import TRTMimiCodec
 
 
 def get_vram_mb() -> float:
@@ -76,13 +77,14 @@ def main():
     print(f"[*] Initial VmRSS:   {get_vram_mb():.1f} MB")
 
     # 2. Load Mimi on CUDA
-    print("\n[+] Loading Mimi 24kHz audio codec on CUDA...")
+    print("\n[+] Loading Mimi 24kHz audio codec on CUDA (TensorRT FP16 accelerated)...")
     t_load_mimi_start = time.perf_counter()
-    mimi = get_mimi(mimi_path, device="cuda")
-    mimi.eval()
-    mimi.streaming_forever(1)
+    mimi_base = get_mimi(mimi_path, device="cuda")
+    enc_engine = os.path.join(os.path.dirname(__file__), "seanet_encoder.engine")
+    dec_engine = os.path.join(os.path.dirname(__file__), "seanet_decoder.engine")
+    mimi = TRTMimiCodec(mimi_base, enc_engine, dec_engine)
     t_load_mimi = time.perf_counter() - t_load_mimi_start
-    print(f"    Loaded Mimi in {t_load_mimi:.2f} s | VmRSS: {get_vram_mb():.1f} MB")
+    print(f"    Loaded & accelerated Mimi in {t_load_mimi:.2f} s | VmRSS: {get_vram_mb():.1f} MB")
 
     # 3. Load BMOEngine & Capture CUDA Graphs
     print("\n[+] Initializing BMOEngine (n_ctx=512)...")
@@ -142,7 +144,10 @@ def main():
             c = mimi.encode(dummy_frame)
             toks = c[0, :, 0].detach().cpu().numpy().astype(np.int32)
             inp_toks = np.zeros(17, dtype=np.int32)
-            inp_toks[1:9] = toks
+            inp_toks[0] = 32000
+            inp_toks[1:9] = 2048
+            inp_toks[9] = toks[0]
+            inp_toks[10:] = 2048
             z, t_logits = engine.forward_temporal(inp_toks)
             prev_t = int(np.argmax(t_logits))
             for d in range(8):
@@ -166,8 +171,13 @@ def main():
     latencies_total = []
 
     generated_pcm_frames = []
-    agent_prev_audio = np.zeros(8, dtype=np.int32)
-    current_text_token = 3  # PAD token
+    # Verified Moshi delay buffers
+    audio_init = 2048
+    text_init = 32000
+    prev_user_audio = np.full(8, audio_init, dtype=np.int32)
+    prev_agent_text = text_init
+    prev_agent_audio = np.full(8, audio_init, dtype=np.int32)
+    prev_agent_cb0 = 1049
     tokens_17 = np.zeros(17, dtype=np.int32)
 
     start_rss = get_vram_mb()
@@ -190,31 +200,36 @@ def main():
             user_tokens = user_codes[0, :, 0].detach().cpu().numpy().astype(np.int32)
 
             # Step B: Interleave 17 tokens
-            tokens_17[0] = current_text_token
-            tokens_17[1:9] = user_tokens
-            tokens_17[9:17] = agent_prev_audio
+            tokens_17[0] = prev_agent_text
+            tokens_17[1:9] = prev_agent_audio
+            tokens_17[9] = user_tokens[0]
+            tokens_17[10:17] = prev_user_audio[1:8]
 
             # Step C: BMO Temporal Forward
             t_temp_start = time.perf_counter()
             z, text_logits = engine.forward_temporal(tokens_17)
             t_temporal = (time.perf_counter() - t_temp_start) * 1000.0
 
+            text_logits[32000:] = -1e9
             next_text_token = int(np.argmax(text_logits))
 
             # Step D: BMO Depth Cascade (8 codebooks)
             t_depth_start = time.perf_counter()
-            agent_tokens = np.zeros(8, dtype=np.int32)
+            curr_agent_audio = np.zeros(8, dtype=np.int32)
             depth_prev = next_text_token
             for cb_idx in range(8):
                 depth_logits = engine.forward_depth(cb_idx, depth_prev, z)
+                depth_logits[2048:] = -1e9
                 depth_prev = int(np.argmax(depth_logits))
-                agent_tokens[cb_idx] = depth_prev
+                curr_agent_audio[cb_idx] = depth_prev
             t_depth = (time.perf_counter() - t_depth_start) * 1000.0
 
             t_bmo = t_temporal + t_depth
 
-            # Step E: Mimi Decode
-            agent_tensor_gpu.copy_(torch.from_numpy(agent_tokens).view(1, 8, 1))
+            # Step E: Mimi Decode (un-delayed)
+            decode_audio = curr_agent_audio.copy()
+            decode_audio[0] = prev_agent_cb0
+            agent_tensor_gpu.copy_(torch.from_numpy(decode_audio).view(1, 8, 1))
             t_dec_start = time.perf_counter()
             decoded_frame = mimi.decode(agent_tensor_gpu)  # [1, 1, 1920]
             torch.cuda.synchronize()
@@ -225,8 +240,11 @@ def main():
             # Record frame output and update state
             pcm_out = decoded_frame[0, 0].detach().cpu().numpy()
             generated_pcm_frames.append(pcm_out)
-            agent_prev_audio = agent_tokens
-            current_text_token = next_text_token
+
+            prev_agent_cb0 = curr_agent_audio[0]
+            prev_agent_audio = curr_agent_audio
+            prev_agent_text = next_text_token
+            prev_user_audio = user_tokens
 
             # Log metrics
             latencies_enc.append(t_enc)

@@ -17,10 +17,14 @@ llama.cpp
 # Logs & temp files
 *.log
 *.tmp
+*.wav
 .cache/
 
 # System files
 .DS_Store
 Thumbs.db
 __pycache__/
-output_bmo_response.wav
+
+# TensorRT & ONNX artifacts (generate via export_trt_mimi.py)
+*.onnx
+*.engine

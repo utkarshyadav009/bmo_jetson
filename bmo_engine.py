@@ -141,7 +141,7 @@ class BMOEngine:
             return bool(_lib.bmo_has_cuda_graphs(self._h))
         return False
 
-    def forward_temporal(self, tokens: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def forward_temporal(self, tokens: np.ndarray, copy: bool = False) -> Tuple[np.ndarray, np.ndarray]:
         assert tokens.dtype == np.int32 and tokens.shape == (self.n_codebooks,), (
             f"Expected int32 array of shape ({self.n_codebooks},), got {tokens.dtype} shape {tokens.shape}"
         )
@@ -159,7 +159,9 @@ class BMOEngine:
             err = _lib.bmo_last_error(self._h)
             raise RuntimeError(f"forward_temporal rc={rc}: {err.decode() if err else 'unknown'}")
         self._pos += 1
-        return self._buf_z.copy(), self._buf_text.copy()
+        if copy:
+            return self._buf_z.copy(), self._buf_text.copy()
+        return self._buf_z, self._buf_text
 
     def forward_temporal2(
         self,
@@ -197,7 +199,7 @@ class BMOEngine:
         self._pos += 1
         return self._buf_z.copy(), self._buf_text.copy(), cap_out
 
-    def forward_depth(self, cb_index: int, prev_token: int, transformer_out: np.ndarray) -> np.ndarray:
+    def forward_depth(self, cb_index: int, prev_token: int, transformer_out: np.ndarray, copy: bool = False) -> np.ndarray:
         assert transformer_out.dtype == np.float32 and transformer_out.shape == (self.n_embd,), (
             f"Expected float32 array of shape ({self.n_embd},), got {transformer_out.dtype} shape {transformer_out.shape}"
         )
@@ -213,7 +215,9 @@ class BMOEngine:
         if rc != 0:
             err = _lib.bmo_last_error(self._h)
             raise RuntimeError(f"forward_depth rc={rc}: {err.decode() if err else 'unknown'}")
-        return self._buf_audio.copy()
+        if copy:
+            return self._buf_audio.copy()
+        return self._buf_audio
 
     def get_k_cache_f32(self, layer: int, t_start: int, n_positions: int) -> np.ndarray:
         """Temporal K-cache slice as float32, layout (n_positions, n_heads, head_dim)."""
