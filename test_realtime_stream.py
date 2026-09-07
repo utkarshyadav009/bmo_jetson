@@ -42,8 +42,79 @@ torch.set_num_threads(2)
 import sounddevice as sd
 import sphn
 from moshi.models import get_mimi
+from moshi.client_utils import Printer, RawPrinter
 from bmo_engine import BMOEngine
 from bmo_trt_mimi import TRTMimiCodec
+
+
+class MoshiStreamUI:
+    """Real-time Moshi streaming console interface.
+
+    Features:
+    - Boxed terminal frame (80 columns) matching official Kyutai Moshi client.
+    - Displays <pad> tokens in dim gray (color='90') for step-by-step visibility.
+    - Displays <unk> tokens in dim gray (color='90').
+    - Renders speech tokens in bold green (color='1;32') with SentencePiece space restoration.
+    - Preserves boxed borders across info/warning logs and underflow lag alerts.
+    """
+
+    def __init__(self, sp=None, max_cols: int = 80):
+        self.sp = sp
+        self.max_cols = max_cols
+        self.col = 0
+        self.print_header()
+
+    def print_header(self):
+        sys.stdout.write(" " + "-" * (self.max_cols - 2) + " \n| ")
+        sys.stdout.flush()
+        self.col = 2
+
+    def _write_piece(self, visible_text: str, color_code: str = ""):
+        v_len = len(visible_text)
+        if self.col + v_len > self.max_cols - 2:
+            pad = " " * (self.max_cols - 2 - self.col)
+            sys.stdout.write(f"{pad} |\n| ")
+            self.col = 2
+
+        if color_code and sys.stdout.isatty():
+            sys.stdout.write(f"\033[{color_code}m{visible_text}\033[0m")
+        else:
+            sys.stdout.write(visible_text)
+        sys.stdout.flush()
+        self.col += v_len
+
+    def step(self, text_token: int):
+        if text_token == 3:
+            self._write_piece("<pad>", "90")
+        elif text_token == 0:
+            self._write_piece("<unk>", "90")
+        elif self.sp is not None:
+            piece = self.sp.id_to_piece(int(text_token)).replace("\u2581", " ")
+            self._write_piece(piece, "1;32")
+        else:
+            self._write_piece(f"[{text_token}]", "1;32")
+
+    def lag(self):
+        self._write_piece(" [LAG]", "31")
+
+    def log(self, level: str, msg: str):
+        if self.col > 2:
+            pad = " " * (self.max_cols - 2 - self.col)
+            sys.stdout.write(f"{pad} |\n")
+        if sys.stdout.isatty():
+            tag = "\033[1;34m[Info]\033[0m" if level == "info" else "\033[1;31m[Warn]\033[0m"
+        else:
+            tag = f"[{level.capitalize()}]"
+        sys.stdout.write(f"{tag} {msg}\n| ")
+        sys.stdout.flush()
+        self.col = 2
+
+    def close(self):
+        if self.col > 2:
+            pad = " " * (self.max_cols - 2 - self.col)
+            sys.stdout.write(f"{pad} |\n")
+        sys.stdout.write(" " + "-" * (self.max_cols - 2) + " \n")
+        sys.stdout.flush()
 
 
 def get_vram_mb() -> float:
@@ -98,6 +169,8 @@ def main():
     parser.add_argument("--duration", type=float, default=60.0, help="Test duration in seconds (default: 60.0s)")
     parser.add_argument("--device", type=str, default="cuda", help="Execution / compute device (default: 'cuda')")
     parser.add_argument("--audio-device", type=str, default=None, help="Audio device name or index (default: 'default')")
+    parser.add_argument("--bluetooth", "-bt", action="store_true", help="Force Bluetooth headset endpoint (HFP duplex)")
+    parser.add_argument("--usb", action="store_true", help="Force USB speaker/mic endpoint")
     parser.add_argument("--input-wav", type=str, default="/home/bmo/bmo_ref_clip.wav", help="Audio clip to loop for input testing")
     parser.add_argument("--use-mic", "--mic", action="store_true", help="Capture from physical microphone instead of simulated stream")
     parser.add_argument("--warmup-frames", type=int, default=5, help="Number of warmup frames before timing (default: 5)")
@@ -116,14 +189,16 @@ def main():
         endpoint_desc = str(audio_device)
     else:
         try:
+            sys.path.insert(0, os.path.dirname(__file__))
             sys.path.insert(0, "/home/bmo")
             from bmo_audio_routing import detect_and_configure_audio
-            cfg = detect_and_configure_audio(mode="auto")
+            routing_mode = "bluetooth" if args.bluetooth else ("usb" if args.usb else "auto")
+            cfg = detect_and_configure_audio(mode=routing_mode)
             audio_device = cfg["in_dev"]
             endpoint_desc = f"{cfg['desc']} (Pulse Device {audio_device})"
-        except Exception:
+        except Exception as e:
             audio_device = "default"
-            endpoint_desc = "default"
+            endpoint_desc = f"default ({e})"
 
     print("=" * 70)
     print("  BMO Stage 4: Real-Time Full-Duplex Audio Streaming Benchmark")
@@ -242,12 +317,14 @@ def main():
     stop_event = threading.Event()
     playback_speaker_rms = 0.0
     speaker_active_hold = 0
+    recent_lag = False
 
     def output_callback(outdata, frames, time_info, status):
-        nonlocal underflow_count, callback_calls, last_sample, playback_speaker_rms, speaker_active_hold
+        nonlocal underflow_count, callback_calls, last_sample, playback_speaker_rms, speaker_active_hold, recent_lag
         callback_calls += 1
         if status.output_underflow:
             underflow_count += 1
+            recent_lag = True
 
         try:
             pcm_out = output_queue.get_nowait()
@@ -267,6 +344,7 @@ def main():
             else:
                 outdata.fill(0)
             underflow_count += 1
+            recent_lag = True
             if speaker_active_hold > 0:
                 speaker_active_hold -= 1
 
@@ -302,9 +380,9 @@ def main():
         callback=output_callback,
     )
 
-    # Pre-roll 3 frames (240 ms) of comfort silence into output queue
+    # Pre-roll 4 frames (320 ms) of comfort silence into output queue
     silence_frame = np.zeros(frame_size, dtype=np.float32)
-    for _ in range(3):
+    for _ in range(4):
         output_queue.put(silence_frame.copy())
 
     def feeder_thread():
@@ -343,25 +421,28 @@ def main():
     prev_agent_cb0 = 1049  # Mimi silence token for cb0
     tokens_17 = np.zeros(17, dtype=np.int32)
 
-    recent_text_tokens = []
     turn_user_speaking = False
     turn_agent_speaking = False
     turnaround_latencies = []
     user_speech_end_time = 0.0
     agent_rms = 0.0
-    user_silence_tokens = np.array([1049, 243, 783, 1562, 340, 2010, 183, 1665], dtype=np.int32)
     user_speech_consecutive = 0
     user_silence_consecutive = 0
+    agent_silence_consecutive = 0
+    prev_was_silent = True
     session_pcm_records = []
+
+    # Initialize Moshi terminal interface
+    ui = MoshiStreamUI(sp, max_cols=80)
 
     start_rss = get_vram_mb()
     out_stream.start()
     if in_stream is not None:
         in_stream.start()
 
-    print(f"[+] Audio stream active. Running {args.duration:.1f}s live voice test...\n")
+    ui.log("info", f"Audio stream active. Running {args.duration:.1f}s live voice test...")
     if args.use_mic:
-        print("  >>> SPEAK INTO MICROPHONE NOW (e.g. 'Hey BMO, how are you today?') <<<\n")
+        ui.log("info", "Speak into microphone (e.g. 'Hey BMO, how are you today?')")
 
     t_start = time.perf_counter()
     frame_count = 0
@@ -381,13 +462,12 @@ def main():
                 speaker_is_playing = (speaker_active_hold > 0) or (playback_speaker_rms > 0.012) or (agent_rms > 0.012)
 
                 if speaker_is_playing:
-                    # Physical speaker is actively emitting audio. Headset acoustic bleed is ~0.02 - 0.05.
-                    # User barge-in speech into headset mic is typically 0.09 - 0.35 RMS.
-                    echo_threshold = max(0.085, 1.25 * max(playback_speaker_rms, agent_rms))
+                    # User barge-in speech over active speaker output
+                    echo_threshold = max(0.065, 1.25 * max(playback_speaker_rms, agent_rms))
                     required_frames = 3  # 240 ms continuous barge-in
                 else:
-                    # Speaker is quiet / listening for user prompt.
-                    echo_threshold = 0.018
+                    # Speaker is quiet / listening for user speech
+                    echo_threshold = 0.012  # Sensitive threshold (noise floor is ~0.00008)
                     required_frames = 2  # 160 ms continuous speech
 
                 raw_user_speech = user_rms >= echo_threshold
@@ -401,22 +481,27 @@ def main():
                 if not turn_user_speaking and user_speech_consecutive >= required_frames:
                     turn_user_speaking = True
                     if speaker_is_playing:
-                        print("\n  [INTERRUPTION] User speech detected over BMO output!")
+                        ui.log("warning", "[INTERRUPTION] User barge-in speech detected!")
+                    else:
+                        ui.log("info", "[USER SPEAKING] Speech detected.")
                 elif turn_user_speaking and user_silence_consecutive >= 3:
                     turn_user_speaking = False
                     user_speech_end_time = time.perf_counter()
+                    ui.log("info", "[USER SILENCE] User finished speaking.")
 
-                if turn_user_speaking:
-                    # Step A: Mimi Encode
+                # Step A: Adaptive Dual-Mode Input Mimi Encode
+                # If mic is active and user is speaking, encode actual mic audio.
+                # If user is silent or speaker is playing, encode streaming zeros through Mimi.
+                # Maintains causal convolutional states without feedback loops or static attractors.
+                t_enc_0 = time.perf_counter()
+                if not args.use_mic or turn_user_speaking:
                     t_chunk_gpu.copy_(torch.from_numpy(frame_chunk))
-                    t_enc_0 = time.perf_counter()
-                    user_codes = mimi.encode(t_chunk_gpu)
-                    t_enc = (time.perf_counter() - t_enc_0) * 1000.0
-                    user_tokens = user_codes[0, :, 0].detach().cpu().numpy().astype(np.int32)
                 else:
-                    t_enc = 0.0
-                    # Suppress speaker bleed / ambient noise with clean Mimi silence tokens
-                    user_tokens = user_silence_tokens.copy()
+                    t_chunk_gpu.zero_()
+
+                user_codes = mimi.encode(t_chunk_gpu)
+                t_enc = (time.perf_counter() - t_enc_0) * 1000.0
+                user_tokens = user_codes[0, :, 0].detach().cpu().numpy().astype(np.int32)
 
                 # Step B: 17-Token Interleave with Moshi delay invariant
                 if frame_count == 0:
@@ -447,9 +532,6 @@ def main():
                 else:
                     next_text_token = top_1_text
 
-                if not is_pause:
-                    recent_text_tokens.append(next_text_token)
-
                 # Step D: Depth Cascade (8 steps, C++ fused)
                 t_depth_0 = time.perf_counter()
                 curr_agent_audio = engine.forward_depth_cascade(
@@ -462,19 +544,43 @@ def main():
 
                 t_bmo = t_temporal + t_depth
 
-                # Step E: Un-delayed Agent Decode
+                # Step E: Audio Output Gating & Decode
+                is_pad = (next_text_token in (0, 3))
+                if is_pad:
+                    agent_silence_consecutive += 1
+                else:
+                    agent_silence_consecutive = 0
+
                 t_dec = 0.0
                 pcm_out = np.zeros(frame_size, dtype=np.float32)
-                if frame_count > 0:
+                # When agent is sustained silent (>= 3 frames of pad), skip SEANet decode
+                # to conserve GPU time and guarantee true digital silence.
+                if frame_count > 0 and agent_silence_consecutive < 3:
                     decode_audio = curr_agent_audio.copy()
                     decode_audio[0] = prev_agent_cb0
 
                     agent_tensor_gpu.copy_(torch.from_numpy(decode_audio).view(1, 8, 1))
                     t_dec_0 = time.perf_counter()
                     decoded_frame = mimi.decode(agent_tensor_gpu)
-                    torch.cuda.synchronize()
                     t_dec = (time.perf_counter() - t_dec_0) * 1000.0
                     pcm_out = decoded_frame[0, 0].detach().cpu().numpy()
+
+                if agent_silence_consecutive == 0:
+                    if prev_was_silent:
+                        # Fade in smoothly over 1 frame (0.0 -> 1.0) to prevent pop/click
+                        pcm_out = pcm_out * np.linspace(0.0, 1.0, frame_size, dtype=np.float32)
+                        prev_was_silent = False
+                elif agent_silence_consecutive == 1:
+                    # Micro-pause within utterance (80 ms): keep full audio
+                    prev_was_silent = False
+                elif agent_silence_consecutive == 2:
+                    # Utterance ending: fade out smoothly over 1 frame (1.0 -> 0.0)
+                    pcm_out = pcm_out * np.linspace(1.0, 0.0, frame_size, dtype=np.float32)
+                    prev_was_silent = True
+                else:
+                    # Sustained silence / waiting for user: absolute zero silence
+                    pcm_out.fill(0.0)
+                    prev_was_silent = True
 
                 t_frame_total = (time.perf_counter() - t_frame_start) * 1000.0
 
@@ -492,7 +598,7 @@ def main():
                     if user_speech_end_time > 0:
                         turnaround = (time.perf_counter() - user_speech_end_time) * 1000.0
                         turnaround_latencies.append(turnaround)
-                        print(f"\n  [TURN] Turn-around pause: {turnaround:.1f} ms")
+                        ui.log("info", f"[TURN] Turn-around pause: {turnaround:.1f} ms")
                         user_speech_end_time = 0.0
                 elif agent_rms <= 0.01 and turn_agent_speaking:
                     turn_agent_speaking = False
@@ -511,20 +617,24 @@ def main():
                 latencies_dec.append(t_dec)
                 latencies_total.append(t_frame_total)
 
-                # Reset KV cache context when context window fills
-                if engine.pos >= 450:
+                # Moshi UI step: stream text token immediately to console
+                ui.step(next_text_token)
+                if recent_lag:
+                    ui.lag()
+                    recent_lag = False
+
+                # Context window management to prevent attention latency creep
+                if agent_silence_consecutive >= 15 and engine.pos >= 128:
+                    engine.reset()
+                elif engine.pos >= 256:
                     engine.reset()
 
-                # Print real-time transcript & telemetry
-                if sp is not None and frame_count % 12 == 0 and len(recent_text_tokens) >= 12:
-                    words = sp.decode(recent_text_tokens[-12:])
-                    if words.strip():
-                        print(f"  BMO: {words.strip()}")
-
+                # Periodic telemetry
                 if frame_count % 50 == 0:
                     elapsed = time.perf_counter() - t_start
-                    print(
-                        f"    [{elapsed:4.1f}s/{args.duration:.0f}s] Frame {frame_count:4d} | "
+                    ui.log(
+                        "info",
+                        f"[{elapsed:4.1f}s/{args.duration:.0f}s] Frame {frame_count:4d} | "
                         f"Enc: {t_enc:4.1f}ms | Temp: {t_temporal:4.1f}ms | "
                         f"Depth: {t_depth:4.1f}ms | Dec: {t_dec:4.1f}ms | "
                         f"Total: {t_frame_total:4.1f}ms | Underruns: {underflow_count}"
@@ -532,6 +642,7 @@ def main():
 
     finally:
         stop_event.set()
+        ui.close()
         if in_stream is not None:
             in_stream.stop()
             in_stream.close()

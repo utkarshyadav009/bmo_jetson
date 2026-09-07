@@ -12,10 +12,10 @@ export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128"
 
 # Audio endpoint configuration
 if [ "$1" == "--bluetooth" ] || [ "$1" == "-bt" ]; then
-    python3 /home/bmo/bmo_audio_routing.py --mode bluetooth
+    python3 "${SCRIPT_DIR}/bmo_audio_routing.py" --mode bluetooth
     shift
 elif [ "$1" == "--usb" ]; then
-    python3 /home/bmo/bmo_audio_routing.py --mode usb
+    python3 "${SCRIPT_DIR}/bmo_audio_routing.py" --mode usb
     shift
 fi
 
