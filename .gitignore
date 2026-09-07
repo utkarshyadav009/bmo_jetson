@@ -19,6 +19,7 @@ llama.cpp
 *.log
 *.tmp
 *.wav
+!verification_audio/*.wav
 *.raw
 .cache/
 
