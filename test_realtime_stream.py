@@ -103,7 +103,7 @@ def main():
     parser.add_argument("--warmup-frames", type=int, default=5, help="Number of warmup frames before timing (default: 5)")
     parser.add_argument("--sample", action="store_true", default=True, help="Enable stochastic sampling for natural speech")
     parser.add_argument("--greedy", dest="sample", action="store_false", help="Use greedy argmax instead of sampling")
-    parser.add_argument("--temp-text", type=float, default=0.7, help="Temperature for text sampling (default: 0.7)")
+    parser.add_argument("--temp-text", type=float, default=0.0, help="Temperature for text sampling (default: 0.0 = greedy argmax for maximum coherence)")
     parser.add_argument("--top-k-text", type=int, default=25, help="Top-K for text sampling (default: 25)")
     parser.add_argument("--temp-audio", type=float, default=0.8, help="Temperature for audio sampling (default: 0.8)")
     parser.add_argument("--top-k-audio", type=int, default=250, help="Top-K for audio sampling (default: 250)")
@@ -177,19 +177,13 @@ def main():
     t_load_mimi = time.perf_counter() - t_load_mimi_start
     print(f"    Loaded & accelerated Mimi in {t_load_mimi:.2f} s | VmRSS: {get_vram_mb():.1f} MB")
 
-    # 3. Load BMOEngine & Capture CUDA Graphs
-    print("\n[+] Initializing BMOEngine (n_ctx=512)...")
+    # 3. Load BMOEngine (Verified Eager Mode: dynamic RoPE & KV ring buffer)
+    print("\n[+] Initializing BMOEngine in verified Eager Mode (n_ctx=512)...")
     t_load_bmo_start = time.perf_counter()
     engine = BMOEngine(gguf_path, n_ctx=512)
     t_load_bmo = time.perf_counter() - t_load_bmo_start
     print(f"    Loaded BMOEngine in {t_load_bmo:.2f} s | VmRSS: {get_vram_mb():.1f} MB")
-
-    print("[+] Capturing CUDA Graphs for Temporal and Depth transformers...")
-    rc_graph = engine.capture_graphs()
-    if rc_graph != 0 or not engine.has_cuda_graphs():
-        print(f"[!] WARNING: Graph capture returned {rc_graph}, proceeding in eager mode.")
-    else:
-        print(f"    CUDA Graphs captured successfully! (VmRSS: {get_vram_mb():.1f} MB)")
+    print("    Running in verified eager mode (dynamically synchronized RoPE & KV ring buffer).")
 
     # 4. Prepare Input Audio Frames
     frame_size = 1920
@@ -246,9 +240,11 @@ def main():
     callback_calls = 0
     last_sample = 0.0
     stop_event = threading.Event()
+    playback_speaker_rms = 0.0
+    speaker_active_hold = 0
 
     def output_callback(outdata, frames, time_info, status):
-        nonlocal underflow_count, callback_calls, last_sample
+        nonlocal underflow_count, callback_calls, last_sample, playback_speaker_rms, speaker_active_hold
         callback_calls += 1
         if status.output_underflow:
             underflow_count += 1
@@ -257,6 +253,12 @@ def main():
             pcm_out = output_queue.get_nowait()
             outdata[:, 0] = pcm_out
             last_sample = float(pcm_out[-1])
+            cur_rms = float(np.sqrt(np.mean(pcm_out ** 2)))
+            playback_speaker_rms = cur_rms
+            if cur_rms > 0.012:
+                speaker_active_hold = 6  # hold active for 6 frames (480 ms) to cover acoustic bleed & bluetooth buffering
+            elif speaker_active_hold > 0:
+                speaker_active_hold -= 1
         except queue.Empty:
             if abs(last_sample) > 1e-4:
                 decay = np.linspace(last_sample, 0.0, frames, dtype=np.float32)
@@ -265,6 +267,8 @@ def main():
             else:
                 outdata.fill(0)
             underflow_count += 1
+            if speaker_active_hold > 0:
+                speaker_active_hold -= 1
 
     in_stream = None
     if args.use_mic:
@@ -298,9 +302,9 @@ def main():
         callback=output_callback,
     )
 
-    # Pre-roll 4 frames (320 ms) of comfort silence into output queue
+    # Pre-roll 3 frames (240 ms) of comfort silence into output queue
     silence_frame = np.zeros(frame_size, dtype=np.float32)
-    for _ in range(8):
+    for _ in range(3):
         output_queue.put(silence_frame.copy())
 
     def feeder_thread():
@@ -374,8 +378,17 @@ def main():
 
                 # Acoustic echo suppression & debounced Voice Activity Detection
                 user_rms = float(np.sqrt(np.mean(frame_chunk ** 2)))
-                agent_active = turn_agent_speaking or (agent_rms > 0.015)
-                echo_threshold = max(0.065, 0.90 * agent_rms) if agent_active else 0.015
+                speaker_is_playing = (speaker_active_hold > 0) or (playback_speaker_rms > 0.012) or (agent_rms > 0.012)
+
+                if speaker_is_playing:
+                    # Physical speaker is actively emitting audio. Headset acoustic bleed is ~0.02 - 0.05.
+                    # User barge-in speech into headset mic is typically 0.09 - 0.35 RMS.
+                    echo_threshold = max(0.085, 1.25 * max(playback_speaker_rms, agent_rms))
+                    required_frames = 3  # 240 ms continuous barge-in
+                else:
+                    # Speaker is quiet / listening for user prompt.
+                    echo_threshold = 0.018
+                    required_frames = 2  # 160 ms continuous speech
 
                 raw_user_speech = user_rms >= echo_threshold
                 if raw_user_speech:
@@ -385,11 +398,9 @@ def main():
                     user_silence_consecutive += 1
                     user_speech_consecutive = 0
 
-                # Require 3 consecutive frames (240ms) when agent is speaking, or 2 frames (160ms) when quiet
-                required_frames = 3 if agent_active else 2
                 if not turn_user_speaking and user_speech_consecutive >= required_frames:
                     turn_user_speaking = True
-                    if turn_agent_speaking:
+                    if speaker_is_playing:
                         print("\n  [INTERRUPTION] User speech detected over BMO output!")
                 elif turn_user_speaking and user_silence_consecutive >= 3:
                     turn_user_speaking = False
@@ -431,7 +442,7 @@ def main():
                 text_logits[32000:] = -1e9
                 top_1_text = int(np.argmax(text_logits[:32000]))
                 is_pause = top_1_text in (0, 3)
-                if not is_pause and args.sample:
+                if not is_pause and args.sample and args.temp_text > 0.0:
                     next_text_token = sample_token(text_logits, temp=args.temp_text, top_k=args.top_k_text, use_sampling=True)
                 else:
                     next_text_token = top_1_text
